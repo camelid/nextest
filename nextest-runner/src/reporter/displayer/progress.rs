@@ -490,16 +490,13 @@ impl ProgressBarState {
     }
 
     fn remove_test(&mut self, test_instance: &TestInstanceId) {
-        if let Some(running_tests) = &mut self.running_tests {
-            running_tests.remove(
-                running_tests
-                    .iter()
-                    .position(|e| {
-                        &e.binary_id == test_instance.binary_id
-                            && &e.test_name == test_instance.test_name
-                    })
-                    .expect("finished test to have started"),
-            );
+        if let Some(running_tests) = &mut self.running_tests
+            && let Some(position) = running_tests.iter().position(|e| {
+                // Cached completions intentionally have no preceding `TestStarted` event.
+                &e.binary_id == test_instance.binary_id && &e.test_name == test_instance.test_name
+            })
+        {
+            running_tests.remove(position);
         }
     }
 

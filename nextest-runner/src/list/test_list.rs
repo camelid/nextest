@@ -1935,7 +1935,9 @@ mod tests {
     use super::*;
     use crate::{
         cargo_config::{TargetDefinitionLocation, TargetTriple, TargetTripleSource},
-        config::scripts::{ScriptCommand, ScriptCommandEnvMap, ScriptCommandRelativeTo},
+        config::scripts::{
+            ScriptCommand, ScriptCommandEnvMap, ScriptCommandRelativeTo, WrapperScriptProtocol,
+        },
         list::{
             SerializableFormat,
             test_helpers::{PACKAGE_GRAPH_FIXTURE, package_metadata},
@@ -2474,6 +2476,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::None,
                 },
                 target_runner: WrapperScriptTargetRunner::Ignore,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_ignore = TestCommandCli::default();
             cli_wrapper_ignore.apply_wrappers(
@@ -2513,6 +2516,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::None,
                 },
                 target_runner: WrapperScriptTargetRunner::AroundWrapper,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_around = TestCommandCli::default();
             cli_wrapper_around.apply_wrappers(
@@ -2544,6 +2548,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::None,
                 },
                 target_runner: WrapperScriptTargetRunner::WithinWrapper,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_within = TestCommandCli::default();
             cli_wrapper_within.apply_wrappers(
@@ -2579,6 +2584,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::None,
                 },
                 target_runner: WrapperScriptTargetRunner::OverridesWrapper,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_overrides = TestCommandCli::default();
             cli_wrapper_overrides.apply_wrappers(
@@ -2609,6 +2615,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::None,
                 },
                 target_runner: WrapperScriptTargetRunner::OverridesWrapper,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_overrides_no_runner = TestCommandCli::default();
             cli_wrapper_overrides_no_runner.apply_wrappers(
@@ -2639,6 +2646,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::None,
                 },
                 target_runner: WrapperScriptTargetRunner::Ignore,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_args = TestCommandCli::default();
             cli_wrapper_args.apply_wrappers(
@@ -2687,6 +2695,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::WorkspaceRoot,
                 },
                 target_runner: WrapperScriptTargetRunner::Ignore,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_relative = TestCommandCli::default();
             cli_wrapper_relative.apply_wrappers(
@@ -2724,6 +2733,7 @@ mod tests {
                     relative_to: ScriptCommandRelativeTo::Target,
                 },
                 target_runner: WrapperScriptTargetRunner::Ignore,
+                protocol: WrapperScriptProtocol::None,
             };
             let mut cli_wrapper_relative = TestCommandCli::default();
             cli_wrapper_relative.apply_wrappers(

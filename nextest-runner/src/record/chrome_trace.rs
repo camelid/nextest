@@ -727,11 +727,30 @@ impl ChromeTraceConverter {
                 current_stats,
                 running,
             } => {
-                // Only emit E for the last attempt; earlier attempts were
-                // already closed by TestAttemptFailedWillRetry.
+                // A cache hit is represented as a zero-duration passing finish without a
+                // preceding start because it never consumes a scheduler slot. It contributes
+                // to counters, but it does not produce a trace span.
                 let last = run_statuses.last_status();
+                let Some(tid) = self
+                    .slot_assignments
+                    .get(&test_instance)
+                    .map(|assignment| assignment.global_slot + TID_OFFSET)
+                else {
+                    if run_statuses.len() == 1
+                        && last.time_taken.is_zero()
+                        && matches!(last.result, ExecutionResultDescription::Pass)
+                    {
+                        self.running_test_count = running;
+                        self.emit_counter_event(end_us);
+                        self.emit_results_counter_event(end_us, &current_stats);
+                        return Ok(());
+                    }
+                    return Err(ChromeTraceError::MissingTestStart {
+                        test_name: test_instance.test_name.clone(),
+                        binary_id: test_instance.binary_id.clone(),
+                    });
+                };
                 let pid = self.pid_for_test(&test_instance.binary_id);
-                let tid = self.tid_for_test(&test_instance)?;
 
                 // Include flaky_result only when the test was actually
                 // flaky (retried and eventually passed).
@@ -2190,6 +2209,53 @@ mod tests {
         assert_eq!(slow["args"]["elapsed_secs"], 5.0);
         assert_eq!(slow["args"]["script_id"], "db-setup");
         assert_eq!(slow["pid"], SETUP_SCRIPT_PID);
+    }
+
+    #[test]
+    fn synthetic_zero_duration_finish_without_start_has_no_span() {
+        let events = vec![
+            Ok(run_started(ts(1000))),
+            Ok(test_finished_pass(
+                ts(1000),
+                "my-crate::bin/my-test",
+                "tests::cached",
+                ts(1000),
+                Duration::ZERO,
+                0,
+            )),
+            Ok(run_finished(ts(1000), ts(1000), Duration::ZERO)),
+        ];
+
+        let (_parsed, trace_events) = convert_and_parse(events, ChromeTraceGroupBy::Binary);
+
+        assert!(
+            !trace_events.iter().any(|event| event["cat"] == "test"),
+            "a cached finish must not produce an unmatched test span"
+        );
+        assert_eq!(
+            trace_events
+                .iter()
+                .filter(|event| event["ph"] == "C" && event["name"] == "test results")
+                .count(),
+            1,
+        );
+
+        let malformed = vec![Ok(test_finished_pass(
+            ts(1001),
+            "my-crate::bin/my-test",
+            "tests::missing-start",
+            ts(1000),
+            Duration::from_secs(1),
+            0,
+        ))];
+        let error = convert_to_chrome_trace(
+            &test_version(),
+            malformed,
+            ChromeTraceGroupBy::Binary,
+            ChromeTraceMessageFormat::Json,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ChromeTraceError::MissingTestStart { .. }));
     }
 
     #[test]

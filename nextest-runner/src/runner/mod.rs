@@ -10,6 +10,7 @@
 //!
 //! [_The runner loop_]: https://nexte.st/docs/design/architecture/runner-loop/
 
+mod cache;
 mod dispatcher;
 mod executor;
 mod imp;
@@ -24,6 +25,7 @@ mod os;
 #[path = "windows.rs"]
 mod os;
 
+use cache::*;
 use dispatcher::*;
 use executor::*;
 pub use imp::*;

@@ -28,6 +28,13 @@ impl ScriptCommandEnvMap {
         }
     }
 
+    /// Iterates over environment variables in deterministic key order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
     /// Creates a new `ScriptCommandEnvMap` from a `BTreeMap`, validating that
     /// all keys are valid environment variable names.
     #[cfg(test)]

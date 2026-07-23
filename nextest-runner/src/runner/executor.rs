@@ -11,8 +11,9 @@
 //! just a better abstraction, it also provides a better user experience (less
 //! inconsistent state).
 
-use super::{ChildPid, HandleSignalResult, Interceptor, VersionEnvVars};
+use super::{CacheLookup, ChildPid, HandleSignalResult, Interceptor, VersionEnvVars};
 use crate::{
+    cache_protocol::CACHE_TOKEN_ENV,
     config::{
         core::EvaluatableProfile,
         elements::{
@@ -75,6 +76,7 @@ pub(super) struct ExecutorContext<'a> {
     // command-line.
     force_flaky_result: Option<FlakyResult>,
     interceptor: Interceptor,
+    cache_lookup: CacheLookup,
     version_env_vars: VersionEnvVars,
 }
 
@@ -91,6 +93,7 @@ impl<'a> ExecutorContext<'a> {
         force_retries: Option<RetryPolicy>,
         force_flaky_result: Option<FlakyResult>,
         interceptor: Interceptor,
+        cache_lookup: CacheLookup,
         version_env_vars: VersionEnvVars,
     ) -> Self {
         Self {
@@ -104,6 +107,7 @@ impl<'a> ExecutorContext<'a> {
             force_retries,
             force_flaky_result,
             interceptor,
+            cache_lookup,
             version_env_vars,
         }
     }
@@ -749,6 +753,9 @@ impl<'a> ExecutorContext<'a> {
         );
 
         let command_mut = cmd.command_mut();
+        if let Some(cache_token) = self.cache_lookup.token(test.test_instance.id()) {
+            command_mut.env(CACHE_TOKEN_ENV, cache_token);
+        }
 
         // Test-related environment variables.
         command_mut.env("NEXTEST_RUN_ID", self.run_id.to_string());

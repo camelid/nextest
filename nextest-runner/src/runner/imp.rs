@@ -1,7 +1,7 @@
 // Copyright (c) The nextest Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{DispatcherContext, ExecutorContext, RunnerTaskState};
+use super::{CacheLookup, CacheSession, DispatcherContext, ExecutorContext, RunnerTaskState};
 use crate::{
     config::{
         core::EvaluatableProfile,
@@ -361,6 +361,28 @@ impl TestRunnerBuilder {
         };
         let max_fail = self.max_fail.unwrap_or_else(|| profile.max_fail());
 
+        let cache_session =
+            if self.stress_condition.is_none() && matches!(&self.interceptor, Interceptor::None) {
+                CacheSession::prepare(
+                    test_list,
+                    profile,
+                    run_id,
+                    &version_env_vars,
+                    &double_spawn,
+                    &target_runner,
+                    test_threads,
+                    self.capture_strategy,
+                    self.retries,
+                    self.flaky_result,
+                    self.expected_outstanding.is_none(),
+                )
+            } else {
+                None
+            };
+        let cache_lookup = cache_session
+            .as_ref()
+            .map_or_else(CacheLookup::default, CacheSession::lookup);
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("nextest-runner-worker")
@@ -390,9 +412,11 @@ impl TestRunnerBuilder {
                 stress_condition: self.stress_condition,
                 interceptor: self.interceptor,
                 expected_outstanding: self.expected_outstanding,
+                cache_lookup,
                 version_env_vars,
                 runtime,
             },
+            cache_session,
             signal_handler,
             input_handler,
         })
@@ -445,6 +469,7 @@ impl FromStr for StressCount {
 #[derive(Debug)]
 pub struct TestRunner<'a> {
     inner: TestRunnerInner<'a>,
+    cache_session: Option<CacheSession>,
     signal_handler: SignalHandler,
     input_handler: InputHandler,
 }
@@ -505,11 +530,15 @@ impl<'a> TestRunner<'a> {
         let mut report_cancel_tx = Some(report_cancel_tx);
         let mut first_error = None;
 
+        let cache_session = &mut self.cache_session;
         let res = self.inner.execute(
             &mut self.signal_handler,
             &mut self.input_handler,
             report_cancel_rx,
             |event| {
+                if let Some(cache_session) = cache_session {
+                    cache_session.observe(&event);
+                }
                 match callback(event) {
                     Ok(()) => {}
                     Err(error) => {
@@ -524,6 +553,10 @@ impl<'a> TestRunner<'a> {
                 }
             },
         );
+
+        if let Some(cache_session) = self.cache_session.take() {
+            cache_session.commit();
+        }
 
         // On Windows, the stdout and stderr futures might spawn processes that keep the runner
         // stuck indefinitely if it's dropped the normal way. Shut it down aggressively, being OK
@@ -561,6 +594,7 @@ struct TestRunnerInner<'a> {
     stress_condition: Option<StressCondition>,
     interceptor: Interceptor,
     expected_outstanding: Option<BTreeSet<OwnedTestInstanceId>>,
+    cache_lookup: CacheLookup,
     version_env_vars: VersionEnvVars,
     runtime: Runtime,
 }
@@ -608,6 +642,7 @@ impl<'a> TestRunnerInner<'a> {
             self.force_retries,
             self.force_flaky_result,
             self.interceptor.clone(),
+            self.cache_lookup.clone(),
             self.version_env_vars.clone(),
         );
 
@@ -713,6 +748,7 @@ impl<'a> TestRunnerInner<'a> {
             let setup_script_data = Arc::new(script_data);
 
             let filter_resp_tx = resp_tx.clone();
+            let cache_lookup = self.cache_lookup.clone();
 
             let tests = self.test_list.to_priority_queue(self.profile);
             let run_tests_fut = futures::stream::iter(tests)
@@ -725,6 +761,7 @@ impl<'a> TestRunnerInner<'a> {
                     // notifications will go out as tests are iterated over, not
                     // all at once.
                     let filter_resp_tx = filter_resp_tx.clone();
+                    let cache_lookup = cache_lookup.clone();
                     async move {
                         if let FilterMatch::Mismatch { reason } =
                             test.instance.test_info.filter_match
@@ -735,6 +772,10 @@ impl<'a> TestRunnerInner<'a> {
                                 test_instance: test.instance,
                                 reason,
                             });
+                            return None;
+                        }
+                        if cache_lookup.is_hit(test.instance.id()) {
+                            let _ = filter_resp_tx.send(ExecutorEvent::Cached { test });
                             return None;
                         }
                         Some(test)

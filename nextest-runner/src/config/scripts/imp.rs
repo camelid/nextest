@@ -737,6 +737,23 @@ pub struct WrapperScriptConfig {
     /// How this wrapper composes with a configured target runner.
     #[serde(default)]
     pub target_runner: WrapperScriptTargetRunner,
+
+    /// An optional run-scoped protocol implemented by this wrapper.
+    #[serde(default)]
+    pub protocol: WrapperScriptProtocol,
+}
+
+/// A run-scoped protocol implemented by a wrapper script.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum WrapperScriptProtocol {
+    /// The wrapper is invoked only as an ordinary command prefix.
+    #[default]
+    None,
+
+    /// The wrapper implements version 1 of nextest's cache-provider protocol.
+    NextestCacheV1,
 }
 
 /// How a wrapper script composes with a configured target runner.
@@ -2135,5 +2152,30 @@ mod tests {
                 panic!("Config should be valid but got error: {e:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_protocol_deserializes_and_defaults() {
+        let configured: WrapperScriptConfig = toml::from_str(
+            r#"
+                command = "wrapper"
+                protocol = "nextest-cache-v1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.protocol, WrapperScriptProtocol::NextestCacheV1);
+
+        let defaulted: WrapperScriptConfig = toml::from_str(
+            r#"
+                command = "wrapper"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(defaulted.protocol, WrapperScriptProtocol::None);
     }
 }

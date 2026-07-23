@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::{
+    cache_protocol::{CACHE_OPERATION_ENV, CACHE_PROTOCOL_ENV, CACHE_TOKEN_ENV},
     cargo_config::EnvironmentMap,
     config::scripts::ScriptCommandEnvMap,
     double_spawn::{DoubleSpawnContext, DoubleSpawnInfo},
@@ -165,6 +166,12 @@ impl TestCommand {
             }
         }
 
+        // Control-plane variables are reserved for direct provider invocations.
+        // Remove inherited values so wrapper execution always enters data-plane mode.
+        cmd.env_remove(CACHE_PROTOCOL_ENV)
+            .env_remove(CACHE_OPERATION_ENV)
+            .env_remove(CACHE_TOKEN_ENV);
+
         let double_spawn = lctx.double_spawn.spawn_context();
 
         Self {
@@ -181,6 +188,10 @@ impl TestCommand {
 
     pub(crate) fn args(&self) -> &[String] {
         &self.args
+    }
+
+    pub(crate) fn explicit_env(&self) -> impl Iterator<Item = (&OsStr, Option<&OsStr>)> {
+        self.command.get_envs()
     }
 
     #[inline]
