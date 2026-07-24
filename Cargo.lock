@@ -2517,6 +2517,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextest-cache"
+version = "0.1.0"
+dependencies = [
+ "atomicwrites",
+ "camino",
+ "camino-tempfile",
+ "etcetera",
+ "hex",
+ "nextest-runner",
+ "nextest-workspace-hack",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nextest-filtering"
 version = "0.21.3"
 dependencies = [

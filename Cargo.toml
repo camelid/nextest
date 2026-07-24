@@ -5,6 +5,7 @@ members = [
   "fixture-data",
   "integration-tests",
   "internal-test",
+  "internal-tools/nextest-cache",
   "internal-tools/zstd-dict",
   "nextest-filtering",
   "nextest-metadata",
