@@ -315,22 +315,19 @@ impl CacheSession {
             TestEventKind::TestAttemptFailedWillRetry { test_instance, .. } => {
                 self.record_disposition(*test_instance, CommitDisposition::Invalidate);
             }
+            TestEventKind::TestCached { test_instance, .. } => {
+                self.record_disposition(*test_instance, CommitDisposition::Hit);
+            }
             TestEventKind::TestFinished {
                 test_instance,
                 run_statuses,
                 ..
             } => {
-                let Some(prepared) = self.lookup.get(*test_instance) else {
-                    return;
-                };
-                let disposition = if prepared.kind == PreparedKind::Hit {
-                    CommitDisposition::Hit
-                } else if run_statuses.len() == 1
+                let disposition = if run_statuses.len() == 1
                     && matches!(
                         run_statuses.last_status().result,
                         ExecutionResultDescription::Pass
-                    )
-                {
+                    ) {
                     CommitDisposition::CleanPass
                 } else {
                     CommitDisposition::Invalidate

@@ -278,6 +278,16 @@ impl<'cfg> LibtestReporter<'cfg> {
                     test_instance,
                 )
             }
+            TestEventKind::TestCached {
+                stress_index,
+                test_instance,
+                ..
+            } => {
+                // Libtest has no cached-result event. `ignored` is its only terminal
+                // result for a test that was not executed; the nextest extension below
+                // disambiguates cached results for consumers that opt into it.
+                (KIND_TEST, EVENT_IGNORED, stress_index, test_instance)
+            }
             TestEventKind::RunStarted { test_list, .. } => {
                 self.test_list = Some(*test_list);
                 return Ok(());
@@ -366,8 +376,10 @@ impl<'cfg> LibtestReporter<'cfg> {
 
         // After all the tests have been started or ignored, put the block of
         // tests that were ignored just as libtest does
-        if matches!(event.kind, TestEventKind::TestFinished { .. })
-            && let Some(ib) = test_suite_mut.ignore_block.take()
+        if matches!(
+            event.kind,
+            TestEventKind::TestFinished { .. } | TestEventKind::TestCached { .. }
+        ) && let Some(ib) = test_suite_mut.ignore_block.take()
         {
             out.extend_from_slice(&ib);
         }
@@ -456,6 +468,14 @@ impl<'cfg> LibtestReporter<'cfg> {
                             test_suite_mut.succeeded += 1;
                         }
                     }
+                }
+            }
+            TestEventKind::TestCached { .. } => {
+                test_suite_mut.running -= 1;
+                test_suite_mut.ignored += 1;
+                out.extend_from_slice(br#","message":"cached result reused""#);
+                if self.emit_nextest_obj {
+                    out.extend_from_slice(br#","nextest":{"cached":true}"#);
                 }
             }
             TestEventKind::TestSkipped { .. } => {

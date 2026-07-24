@@ -470,6 +470,13 @@ where
                     })
                     .or_insert(outcome);
             }
+            TestEventKindSummary::Core(CoreEventKind::TestCached { test_instance, .. }) => {
+                // A cached success must not overwrite a failure already observed for the
+                // same test in a malformed or future event stream.
+                outcomes
+                    .entry(test_instance.clone())
+                    .or_insert(TestOutcome::Passed);
+            }
             TestEventKindSummary::Core(CoreEventKind::TestSkipped {
                 test_instance,
                 reason,
@@ -1582,6 +1589,37 @@ mod tests {
             current_stats: RunStats::default(),
             running: 0,
         })
+    }
+
+    #[test]
+    fn cached_result_is_passing_for_reruns() {
+        let test_instance = OwnedTestInstanceId {
+            binary_id: RustBinaryId::new("test-binary"),
+            test_name: TestCaseName::new("cached"),
+        };
+        let event = TestEventKindSummary::<RecordingSpec>::Core(CoreEventKind::TestCached {
+            stress_index: None,
+            test_instance: test_instance.clone(),
+            current_stats: RunStats {
+                initial_run_count: 1,
+                finished_count: 1,
+                cached: 1,
+                ..RunStats::default()
+            },
+            running: 0,
+        });
+
+        let outcomes = collect_from_events(std::iter::once(Ok::<_, Infallible>(&event))).unwrap();
+
+        assert_eq!(outcomes.get(&test_instance), Some(&TestOutcome::Passed));
+
+        let failed_then_cached = [
+            make_test_finished(test_instance.clone(), None, false),
+            event,
+        ];
+        let outcomes =
+            collect_from_events(failed_then_cached.iter().map(Ok::<_, Infallible>)).unwrap();
+        assert_eq!(outcomes.get(&test_instance), Some(&TestOutcome::Failed));
     }
 
     /// Test that flaky-fail tests are treated as Failed for rerun purposes.

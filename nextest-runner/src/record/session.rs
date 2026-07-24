@@ -247,6 +247,7 @@ fn convert_run_stats_to_status(stats: RunFinishedStats, exit_code: i32) -> Recor
             let completed_stats = CompletedRunStats {
                 initial_run_count: run_stats.initial_run_count,
                 passed: run_stats.passed,
+                cached: run_stats.cached,
                 failed: run_stats.failed_count(),
                 exit_code,
             };

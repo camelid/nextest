@@ -379,6 +379,12 @@ impl ProgressBarState {
                 running,
                 test_instance,
                 ..
+            }
+            | TestEventKind::TestCached {
+                current_stats,
+                running,
+                test_instance,
+                ..
             } => {
                 self.running = *running;
                 self.stats = *current_stats;
@@ -532,7 +538,8 @@ pub(super) fn terminal_progress_value(event: &TestEvent<'_>) -> TermProgress {
         | TestEventKind::SetupScriptSlow { .. }
         | TestEventKind::SetupScriptFinished { .. } => TermProgress::none(),
         TestEventKind::TestStarted { current_stats, .. }
-        | TestEventKind::TestFinished { current_stats, .. } => {
+        | TestEventKind::TestFinished { current_stats, .. }
+        | TestEventKind::TestCached { current_stats, .. } => {
             if current_stats.has_failures() || current_stats.cancel_reason.is_some() {
                 term_progress_errored(current_stats)
             } else {
@@ -612,6 +619,7 @@ pub(super) fn write_summary_str(run_stats: &RunStats, styles: &Styles, out: &mut
         setup_scripts_exec_failed: _,
         setup_scripts_timed_out: _,
         passed,
+        cached,
         passed_slow,
         passed_timed_out: _,
         flaky,
@@ -658,6 +666,15 @@ pub(super) fn write_summary_str(run_stats: &RunStats, styles: &Styles, out: &mut
         swrite!(out, " ({})", text.join(", "));
     }
     swrite!(out, ", ");
+
+    if cached > 0 {
+        swrite!(
+            out,
+            "{} {}, ",
+            cached.style(styles.count),
+            "cached".style(styles.skip),
+        );
+    }
 
     if failed > 0 {
         swrite!(
@@ -757,6 +774,21 @@ mod tests {
     };
     use bytes::Bytes;
     use chrono::Local;
+
+    #[test]
+    fn summary_reports_cached_results_separately() {
+        let stats = RunStats {
+            passed: 2,
+            cached: 3,
+            skipped: 1,
+            ..RunStats::default()
+        };
+        let mut out = String::new();
+
+        write_summary_str(&stats, &Styles::default(), &mut out);
+
+        assert_eq!(out, "2 passed, 3 cached, 1 skipped");
+    }
 
     #[test]
     fn terminal_progress_value_escape_codes() {

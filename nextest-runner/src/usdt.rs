@@ -608,15 +608,18 @@ pub struct UsdtRunDone {
     /// The profile name (e.g., "default", "ci").
     pub profile_name: String,
 
-    /// Total number of tests that were run.
+    /// Total number of tests selected to produce results.
     ///
     /// For stress runs, this consists of the last run's total test count.
     pub total_tests: usize,
 
-    /// Number of tests that passed.
+    /// Number of tests that passed by executing.
     ///
     /// For stress runs, this consists of the last run's passed test count.
     pub passed: usize,
+
+    /// Number of successful test results reused from the cache.
+    pub cached: usize,
 
     /// Number of tests that failed.
     ///
@@ -713,11 +716,14 @@ pub struct UsdtStressSubRunDone {
     /// The duration of this sub-run in nanoseconds.
     pub sub_run_duration_nanos: u64,
 
-    /// Total number of tests that were run in this sub-run.
+    /// Total number of tests selected to produce results in this sub-run.
     pub total_tests: usize,
 
-    /// Number of tests that passed in this sub-run.
+    /// Number of tests that passed by executing in this sub-run.
     pub passed: usize,
+
+    /// Number of successful test results reused from the cache.
+    pub cached: usize,
 
     /// Number of tests that failed in this sub-run.
     pub failed: usize,

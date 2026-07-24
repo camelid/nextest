@@ -470,6 +470,15 @@ impl<'a> DisplayRecordedRunInfo<'a> {
             width = self.alignment.passed_width,
         );
 
+        if stats.cached > 0 {
+            swrite!(
+                result,
+                " / {} {}",
+                stats.cached.style(self.styles.count),
+                "cached".style(self.styles.cancelled),
+            );
+        }
+
         if stats.failed > 0 {
             swrite!(
                 result,
@@ -479,10 +488,11 @@ impl<'a> DisplayRecordedRunInfo<'a> {
             );
         }
 
-        // Calculate tests that were not run (neither passed nor failed).
+        // Calculate tests that produced no result.
         let not_run = stats
             .initial_run_count
             .saturating_sub(stats.passed)
+            .saturating_sub(stats.cached)
             .saturating_sub(stats.failed);
         if not_run > 0 {
             swrite!(
@@ -677,6 +687,14 @@ impl<'a> DisplayRecordedRunInfoDetailed<'a> {
                     "passed:".style(self.styles.label),
                     stats.passed.style(self.styles.passed),
                 )?;
+                if stats.cached > 0 {
+                    writeln!(
+                        f,
+                        "    {:16}{}",
+                        "cached:".style(self.styles.label),
+                        stats.cached.style(self.styles.cancelled),
+                    )?;
+                }
                 if stats.failed > 0 {
                     writeln!(
                         f,
@@ -688,6 +706,7 @@ impl<'a> DisplayRecordedRunInfoDetailed<'a> {
                 let not_run = stats
                     .initial_run_count
                     .saturating_sub(stats.passed)
+                    .saturating_sub(stats.cached)
                     .saturating_sub(stats.failed);
                 if not_run > 0 {
                     writeln!(
@@ -1376,7 +1395,8 @@ mod tests {
             102400,
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 100,
-                passed: 95,
+                passed: 90,
+                cached: 5,
                 failed: 5,
                 exit_code: 100,
             }),
@@ -1387,7 +1407,7 @@ mod tests {
         insta::assert_snapshot!(
             run.display(&index, &ReplayabilityStatus::Replayable, alignment, &Styles::default(), &Redactor::noop())
                 .to_string(),
-            @"  550e8400  2024-06-15 10:30:00      1.000s     100 KB  95 passed / 5 failed"
+            @"  550e8400  2024-06-15 10:30:00      1.000s     100 KB  90 passed / 5 cached / 5 failed"
         );
     }
 
@@ -1421,6 +1441,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 17,
                 passed: 10,
+                cached: 0,
                 failed: 6,
                 exit_code: 100,
             }),
@@ -1446,6 +1467,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 0,
                 passed: 0,
+                cached: 0,
                 failed: 0,
                 exit_code: 0,
             }),
@@ -1566,6 +1588,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 559,
                     passed: 559,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1578,6 +1601,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 51,
                     passed: 51,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1590,6 +1614,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 17,
                     passed: 10,
+                    cached: 0,
                     failed: 6,
                     exit_code: 0,
                 }),
@@ -1705,6 +1730,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 50,
                 passed: 50,
+                cached: 0,
                 failed: 0,
                 exit_code: 0,
             }),
@@ -1733,6 +1759,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 100,
                     passed: 100,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1773,6 +1800,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 10,
                     passed: 10,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1785,6 +1813,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 20,
                     passed: 18,
+                    cached: 0,
                     failed: 2,
                     exit_code: 0,
                 }),
@@ -1797,6 +1826,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 30,
                     passed: 30,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1826,6 +1856,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 5,
                     passed: 5,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1838,6 +1869,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 10,
                     passed: 10,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1869,6 +1901,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 100,
                     passed: 100,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1881,6 +1914,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 200,
                     passed: 200,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1912,6 +1946,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 5,
                     passed: 5,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1925,6 +1960,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 10,
                     passed: 10,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1938,6 +1974,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 20,
                     passed: 20,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -1951,6 +1988,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 30,
                     passed: 28,
+                    cached: 0,
                     failed: 2,
                     exit_code: 0,
                 }),
@@ -1964,6 +2002,7 @@ mod tests {
                 RecordedRunStatus::Completed(CompletedRunStats {
                     initial_run_count: 50,
                     passed: 50,
+                    cached: 0,
                     failed: 0,
                     exit_code: 0,
                 }),
@@ -2008,6 +2047,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 100,
                 passed: 95,
+                cached: 0,
                 failed: 5,
                 exit_code: 100,
             }),
@@ -2192,6 +2232,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 100,
                 passed: 95,
+                cached: 0,
                 failed: 5,
                 exit_code: 100,
             }),
@@ -2212,6 +2253,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 5,
                 passed: 5,
+                cached: 0,
                 failed: 0,
                 exit_code: 0,
             }),
@@ -2251,6 +2293,7 @@ mod tests {
             RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 100,
                 passed: 100,
+                cached: 0,
                 failed: 0,
                 exit_code: 0,
             }),
@@ -2412,6 +2455,7 @@ mod tests {
             status: RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: passed + failed,
                 passed,
+                cached: 0,
                 failed,
                 exit_code: if failed > 0 { 1 } else { 0 },
             }),

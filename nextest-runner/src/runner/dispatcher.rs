@@ -17,17 +17,16 @@ use crate::{
     list::{OwnedTestInstanceId, TestInstance, TestInstanceId, TestInstanceIdKey, TestList},
     output_spec::LiveSpec,
     reporter::events::{
-        CancelReason, ChildExecutionOutputDescription, ChildOutputDescription, ExecuteStatus,
-        ExecutionResultDescription, ExecutionStatuses, FailureDescription, FinalRunStats,
-        InfoResponse, ReporterEvent, RetryData, RunFinishedStats, RunStats, StressIndex,
-        StressProgress, StressRunStats, TestEvent, TestEventKind, TestsNotSeen,
+        CancelReason, ChildExecutionOutputDescription, ExecuteStatus, ExecutionResultDescription,
+        ExecutionStatuses, FailureDescription, FinalRunStats, InfoResponse, ReporterEvent,
+        RunFinishedStats, RunStats, StressIndex, StressProgress, StressRunStats, TestEvent,
+        TestEventKind, TestsNotSeen,
     },
     runner::{ExecutorEvent, RunUnitQuery, SignalRequest, StressCondition, StressCount},
     signal::{
         JobControlEvent, ShutdownEvent, ShutdownSignalEvent, SignalEvent, SignalHandler,
         SignalInfoEvent,
     },
-    test_output::ChildSingleOutput,
     time::StopwatchStart,
 };
 use chrono::Local;
@@ -467,6 +466,7 @@ where
             sub_run_duration_nanos: sub_elapsed.as_nanos() as u64,
             total_tests: self.run_stats.initial_run_count,
             passed: self.run_stats.passed,
+            cached: self.run_stats.cached,
             failed: self.run_stats.failed_count(),
             skipped: self.run_stats.skipped,
         });
@@ -663,39 +663,10 @@ where
 
                 let test_instance = test.instance;
                 self.rerun_cx.mark_seen(test_instance.id());
-                let run_statuses = ExecutionStatuses::new(
-                    vec![ExecuteStatus {
-                        retry_data: RetryData {
-                            attempt: 1,
-                            total_attempts: 1,
-                        },
-                        output: ChildExecutionOutputDescription::Output {
-                            result: Some(ExecutionResultDescription::Pass),
-                            output: ChildOutputDescription::Combined {
-                                output: ChildSingleOutput::from(bytes::Bytes::new()),
-                            },
-                            errors: None,
-                        },
-                        result: ExecutionResultDescription::Pass,
-                        start_time: Local::now().fixed_offset(),
-                        time_taken: Duration::ZERO,
-                        is_slow: false,
-                        delay_before_start: Duration::ZERO,
-                        error_summary: None,
-                        output_error_slice: None,
-                    }],
-                    test.settings.flaky_result(),
-                );
-                self.run_stats.on_test_finished(&run_statuses);
-                self.callback_none_response(TestEventKind::TestFinished {
+                self.run_stats.on_test_cached();
+                self.callback_none_response(TestEventKind::TestCached {
                     stress_index: None,
                     test_instance: test_instance.id(),
-                    success_output: test.settings.success_output(),
-                    failure_output: test.settings.failure_output(),
-                    junit_store_success_output: test.settings.junit_store_success_output(),
-                    junit_store_failure_output: test.settings.junit_store_failure_output(),
-                    junit_flaky_fail_status: test.settings.junit_flaky_fail_status(),
-                    run_statuses,
                     current_stats: self.run_stats,
                     running: self.running(),
                 })
@@ -1187,6 +1158,7 @@ where
             profile_name: self.profile_name.clone(),
             total_tests: self.run_stats.initial_run_count,
             passed: self.run_stats.passed,
+            cached: self.run_stats.cached,
             failed: self.run_stats.failed_count(),
             skipped: self.run_stats.skipped,
             duration_nanos: stopwatch_end.active.as_nanos() as u64,

@@ -37,6 +37,16 @@ static STDOUT_NOT_CAPTURED: &str = "(stdout not captured)";
 static STDERR_NOT_CAPTURED: &str = "(stderr not captured)";
 static PROCESS_FAILED_TO_START: &str = "(process failed to start)";
 
+fn cached_testcase(test_instance: TestInstanceId<'_>) -> TestCase {
+    let mut status = TestCaseStatus::skipped();
+    status
+        .set_type("cached")
+        .set_message("cached result reused");
+    let mut testcase = TestCase::new(test_instance.test_name.as_str(), status);
+    testcase.set_classname(test_instance.binary_id.as_str());
+    testcase
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct MetadataJunit<'cfg> {
     mode: NextestRunMode,
@@ -240,6 +250,15 @@ impl<'cfg> MetadataJunit<'cfg> {
                 );
 
                 testsuite.add_test_case(testcase);
+            }
+            TestEventKind::TestCached {
+                stress_index,
+                test_instance,
+                ..
+            } => {
+                let testcase = cached_testcase(test_instance);
+                self.testsuite_for_test(stress_index, test_instance)
+                    .add_test_case(testcase);
             }
             TestEventKind::TestSkipped { .. } => {
                 // TODO: report skipped tests? causes issues if we want to aggregate runs across
@@ -560,6 +579,22 @@ mod tests {
     };
     use bytes::Bytes;
     use std::{io, sync::Arc};
+
+    #[test]
+    fn cached_testcase_is_skipped_without_execution_timing() {
+        let binary_id = RustBinaryId::new("test-binary");
+        let test_name = nextest_metadata::TestCaseName::new("cached-test");
+        let testcase = cached_testcase(TestInstanceId {
+            binary_id: &binary_id,
+            test_name: &test_name,
+        });
+
+        assert_eq!(testcase.classname.as_deref(), Some("test-binary"));
+        assert_eq!(testcase.timestamp, None);
+        assert_eq!(testcase.time, None);
+        assert_eq!(get_message(&testcase.status), Some("cached result reused"));
+        assert!(matches!(testcase.status, TestCaseStatus::Skipped { .. }));
+    }
 
     #[test]
     fn test_set_execute_status_props() {

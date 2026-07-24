@@ -454,6 +454,17 @@ impl ChromeTraceConverter {
 
                 self.slot_assignments.insert(test_instance, slot_assignment);
             }
+            CoreEventKind::TestCached {
+                test_instance: _,
+                stress_index: _,
+                current_stats,
+                running,
+            } => {
+                let ts_us = datetime_to_microseconds(timestamp);
+                self.running_test_count = running;
+                self.emit_counter_event(ts_us);
+                self.emit_results_counter_event(ts_us, &current_stats);
+            }
             CoreEventKind::TestRetryStarted {
                 test_instance,
                 slot_assignment,
@@ -727,24 +738,12 @@ impl ChromeTraceConverter {
                 current_stats,
                 running,
             } => {
-                // A cache hit is represented as a zero-duration passing finish without a
-                // preceding start because it never consumes a scheduler slot. It contributes
-                // to counters, but it does not produce a trace span.
                 let last = run_statuses.last_status();
                 let Some(tid) = self
                     .slot_assignments
                     .get(&test_instance)
                     .map(|assignment| assignment.global_slot + TID_OFFSET)
                 else {
-                    if run_statuses.len() == 1
-                        && last.time_taken.is_zero()
-                        && matches!(last.result, ExecutionResultDescription::Pass)
-                    {
-                        self.running_test_count = running;
-                        self.emit_counter_event(end_us);
-                        self.emit_results_counter_event(end_us, &current_stats);
-                        return Ok(());
-                    }
                     return Err(ChromeTraceError::MissingTestStart {
                         test_name: test_instance.test_name.clone(),
                         binary_id: test_instance.binary_id.clone(),
@@ -1032,6 +1031,7 @@ impl ChromeTraceConverter {
             bp: None,
             args: Some(ChromeTraceArgs::ResultsCounter(ResultsCounterArgs {
                 passed: stats.passed,
+                cached: stats.cached,
                 flaky: stats.flaky,
                 failed: stats.failed_count(),
             })),
@@ -1641,6 +1641,10 @@ struct StressSubRunEndArgs {
 
 // --- Counter and metadata args ---
 
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// Args for counter events tracking running tests and scripts.
 #[derive(Serialize)]
 struct CounterArgs {
@@ -1654,6 +1658,9 @@ struct CounterArgs {
 struct ResultsCounterArgs {
     /// Tests that passed on the first attempt (excludes flaky).
     passed: usize,
+    /// Successful test results reused from the cache.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    cached: usize,
     /// Tests that passed on retry.
     flaky: usize,
     /// Tests that failed all attempts, including exec failures.
@@ -1968,6 +1975,24 @@ mod tests {
         )
     }
 
+    fn test_cached(
+        timestamp: DateTime<FixedOffset>,
+        binary: &str,
+        test: &str,
+        current_stats: RunStats,
+        running: usize,
+    ) -> TestEventSummary<RecordingSpec> {
+        core_event(
+            timestamp,
+            CoreEventKind::TestCached {
+                stress_index: None,
+                test_instance: test_id(binary, test),
+                current_stats,
+                running,
+            },
+        )
+    }
+
     fn test_finished_pass(
         timestamp: DateTime<FixedOffset>,
         binary: &str,
@@ -2212,15 +2237,20 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_zero_duration_finish_without_start_has_no_span() {
+    fn cached_result_has_counters_but_no_span() {
+        let stats = RunStats {
+            initial_run_count: 1,
+            finished_count: 1,
+            cached: 1,
+            ..RunStats::default()
+        };
         let events = vec![
             Ok(run_started(ts(1000))),
-            Ok(test_finished_pass(
+            Ok(test_cached(
                 ts(1000),
                 "my-crate::bin/my-test",
                 "tests::cached",
-                ts(1000),
-                Duration::ZERO,
+                stats,
                 0,
             )),
             Ok(run_finished(ts(1000), ts(1000), Duration::ZERO)),
@@ -2230,22 +2260,24 @@ mod tests {
 
         assert!(
             !trace_events.iter().any(|event| event["cat"] == "test"),
-            "a cached finish must not produce an unmatched test span"
+            "a cached result must not produce a test span"
         );
-        assert_eq!(
-            trace_events
-                .iter()
-                .filter(|event| event["ph"] == "C" && event["name"] == "test results")
-                .count(),
-            1,
-        );
+        let result = trace_events
+            .iter()
+            .find(|event| event["ph"] == "C" && event["name"] == "test results")
+            .expect("a cached result counter");
+        assert_eq!(result["args"]["passed"], 0);
+        assert_eq!(result["args"]["cached"], 1);
+    }
 
+    #[test]
+    fn zero_duration_finish_without_start_is_rejected() {
         let malformed = vec![Ok(test_finished_pass(
-            ts(1001),
+            ts(1000),
             "my-crate::bin/my-test",
             "tests::missing-start",
             ts(1000),
-            Duration::from_secs(1),
+            Duration::ZERO,
             0,
         ))];
         let error = convert_to_chrome_trace(
@@ -3284,12 +3316,13 @@ mod tests {
     /// pass/flaky/failed counts from `current_stats`.
     #[test]
     fn results_counter_events() {
-        // Build stats that represent: 3 passed (including 1 flaky), 1 failed,
-        // 1 exec_failed. The counter should show passed=3, flaky=1, failed=2.
+        // Build stats that represent: 3 passed (including 1 flaky), 1 cached,
+        // 1 failed, and 1 exec_failed.
         let stats = RunStats {
-            initial_run_count: 5,
-            finished_count: 5,
+            initial_run_count: 6,
+            finished_count: 6,
             passed: 3,
+            cached: 1,
             flaky: 1,
             failed: 1,
             exec_failed: 1,
@@ -3334,6 +3367,8 @@ mod tests {
         let args = &results_counters[0]["args"];
         // passed = 3.
         assert_eq!(args["passed"], 3);
+        // cached = 1.
+        assert_eq!(args["cached"], 1);
         // flaky = 1.
         assert_eq!(args["flaky"], 1);
         // failed = 1 failed + 1 exec_failed = 2.
