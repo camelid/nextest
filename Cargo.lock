@@ -2521,11 +2521,10 @@ name = "nextest-cache"
 version = "0.1.0"
 dependencies = [
  "atomicwrites",
- "camino",
  "camino-tempfile",
  "etcetera",
  "hex",
- "nextest-runner",
+ "libc",
  "nextest-workspace-hack",
  "serde",
  "serde_json",

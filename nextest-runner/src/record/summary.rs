@@ -228,19 +228,6 @@ pub enum CoreEventKind {
         command_line: Vec<String>,
     },
 
-    /// A cached test result was reused.
-    #[serde(rename_all = "kebab-case")]
-    TestCached {
-        /// The stress index, if running a stress test.
-        stress_index: Option<StressIndexSummary>,
-        /// The test instance.
-        test_instance: OwnedTestInstanceId,
-        /// The current run statistics.
-        current_stats: RunStats,
-        /// The number of tests currently running.
-        running: usize,
-    },
-
     /// A test is slow.
     #[serde(rename_all = "kebab-case")]
     TestSlow {
@@ -512,17 +499,6 @@ impl TestEventKindSummary<LiveSpec> {
                 current_stats,
                 running,
                 command_line,
-            }),
-            TestEventKind::TestCached {
-                stress_index,
-                test_instance,
-                current_stats,
-                running,
-            } => Self::Core(CoreEventKind::TestCached {
-                stress_index: stress_index.map(StressIndexSummary::from),
-                test_instance: test_instance.to_owned(),
-                current_stats,
-                running,
             }),
             TestEventKind::TestSlow {
                 stress_index,
@@ -914,40 +890,7 @@ pub enum ZipStoreOutputDescription {
 mod tests {
     use super::*;
     use crate::output_spec::RecordingSpec;
-    use chrono::Utc;
-    use nextest_metadata::{RustBinaryId, TestCaseName};
     use test_strategy::proptest;
-
-    #[test]
-    fn cached_event_serializes_as_core_event() {
-        let event = TestEventSummary::<RecordingSpec> {
-            timestamp: Utc::now().into(),
-            elapsed: Duration::ZERO,
-            kind: TestEventKindSummary::Core(CoreEventKind::TestCached {
-                stress_index: None,
-                test_instance: OwnedTestInstanceId {
-                    binary_id: RustBinaryId::new("test-binary"),
-                    test_name: TestCaseName::new("cached_test"),
-                },
-                current_stats: RunStats {
-                    initial_run_count: 1,
-                    finished_count: 1,
-                    cached: 1,
-                    ..RunStats::default()
-                },
-                running: 0,
-            }),
-        };
-
-        let json = serde_json::to_string(&event).expect("serialization succeeds");
-        assert!(json.contains(r#""type":"core""#));
-        assert!(json.contains(r#""kind":"test-cached""#));
-        assert!(!json.contains("run-statuses"));
-
-        let roundtrip: TestEventSummary<RecordingSpec> =
-            serde_json::from_str(&json).expect("deserialization succeeds");
-        assert_eq!(roundtrip, event);
-    }
 
     #[proptest]
     fn test_event_summary_roundtrips(value: TestEventSummary<RecordingSpec>) {

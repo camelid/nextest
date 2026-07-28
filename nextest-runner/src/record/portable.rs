@@ -1033,7 +1033,6 @@ mod tests {
             status: RecordedRunStatus::Completed(CompletedRunStats {
                 initial_run_count: 10,
                 passed: 9,
-                cached: 0,
                 failed: 1,
                 exit_code: 100,
             }),

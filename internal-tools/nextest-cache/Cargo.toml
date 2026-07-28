@@ -1,6 +1,6 @@
 [package]
 name = "nextest-cache"
-description = "Reference cache-provider wrapper for nextest"
+description = "Reference result-cache wrapper for nextest"
 version = "0.1.0"
 publish = false
 edition.workspace = true
@@ -15,13 +15,14 @@ workspace = true
 atomicwrites.workspace = true
 etcetera.workspace = true
 hex.workspace = true
-camino.workspace = true
-nextest-runner.workspace = true
 nextest-workspace-hack.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 camino-tempfile.workspace = true

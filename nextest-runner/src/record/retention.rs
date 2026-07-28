@@ -446,7 +446,6 @@ mod tests {
         RecordedRunStatus::Completed(CompletedRunStats {
             initial_run_count: 10,
             passed: 10,
-            cached: 0,
             failed: 0,
             exit_code: 0,
         })

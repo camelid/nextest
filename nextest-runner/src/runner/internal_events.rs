@@ -14,7 +14,7 @@ use crate::{
         scripts::{ScriptId, SetupScriptConfig},
     },
     errors::DisplayErrorChain,
-    list::{TestInstance, TestInstanceWithSettings},
+    list::TestInstance,
     output_spec::LiveSpec,
     reporter::{
         TestOutputDisplay, UnitErrorDescription,
@@ -72,9 +72,6 @@ pub(super) enum ExecutorEvent<'a> {
         index: usize,
         total: usize,
         status: SetupScriptExecuteStatus<LiveSpec>,
-    },
-    Cached {
-        test: TestInstanceWithSettings<'a>,
     },
     Started {
         stress_index: Option<StressIndex>,

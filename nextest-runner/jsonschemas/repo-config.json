@@ -1332,10 +1332,6 @@
           "description": "The command to run as the wrapper.",
           "$ref": "#/$defs/ScriptCommand"
         },
-        "protocol": {
-          "description": "An optional run-scoped protocol implemented by this wrapper.",
-          "$ref": "#/$defs/WrapperScriptProtocol"
-        },
         "target-runner": {
           "description": "How this wrapper composes with a configured target runner.",
           "$ref": "#/$defs/WrapperScriptTargetRunner"
@@ -1344,21 +1340,6 @@
       "additionalProperties": false,
       "required": [
         "command"
-      ]
-    },
-    "WrapperScriptProtocol": {
-      "description": "A run-scoped protocol implemented by a wrapper script.",
-      "oneOf": [
-        {
-          "description": "The wrapper is invoked only as an ordinary command prefix.",
-          "type": "string",
-          "const": "none"
-        },
-        {
-          "description": "The wrapper implements version 1 of nextest's cache-provider protocol.",
-          "type": "string",
-          "const": "nextest-cache-v1"
-        }
       ]
     },
     "WrapperScriptTargetRunner": {

@@ -207,26 +207,6 @@ impl<'a> ReplayContext<'a> {
                 })
             }
 
-            CoreEventKind::TestCached {
-                stress_index,
-                test_instance,
-                current_stats,
-                running,
-            } => {
-                let instance_id = self.lookup_test_instance_id(test_instance).ok_or_else(|| {
-                    ReplayConversionError::TestNotFound {
-                        binary_id: test_instance.binary_id.clone(),
-                        test_name: test_instance.test_name.clone(),
-                    }
-                })?;
-                Ok(TestEventKind::TestCached {
-                    stress_index: stress_index.as_ref().map(convert_stress_index),
-                    test_instance: instance_id,
-                    current_stats: *current_stats,
-                    running: *running,
-                })
-            }
-
             CoreEventKind::TestSlow {
                 stress_index,
                 test_instance,

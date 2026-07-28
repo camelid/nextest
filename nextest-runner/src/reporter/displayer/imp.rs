@@ -486,7 +486,6 @@ impl ReporterOutputImpl<'_> {
 
 #[derive(Debug)]
 enum FinalOutput {
-    Cached,
     Skipped(#[expect(dead_code)] MismatchReason),
     Executed {
         run_statuses: ExecutionStatuses<LiveSpec>,
@@ -497,7 +496,6 @@ enum FinalOutput {
 impl FinalOutput {
     fn final_status_level(&self) -> FinalStatusLevel {
         match self {
-            Self::Cached => FinalStatusLevel::Pass,
             Self::Skipped(_) => FinalStatusLevel::Skip,
             Self::Executed { run_statuses, .. } => run_statuses.describe().final_status_level(),
         }
@@ -1055,28 +1053,6 @@ impl<'a> DisplayReporterImpl<'a> {
                     });
                 }
             }
-            TestEventKind::TestCached {
-                stress_index,
-                test_instance,
-                current_stats,
-                ..
-            } => {
-                let counter = TestInstanceCounter::Counter {
-                    current: current_stats.finished_count,
-                    total: current_stats.initial_run_count,
-                };
-                if self.status_levels.status_level >= StatusLevel::Pass {
-                    self.write_cached_line(*stress_index, counter, *test_instance, writer)?;
-                }
-                if self.status_levels.final_status_level >= FinalStatusLevel::Pass {
-                    self.final_outputs.push(FinalOutputEntry {
-                        stress_index: *stress_index,
-                        counter,
-                        instance: *test_instance,
-                        output: FinalOutput::Cached,
-                    });
-                }
-            }
             TestEventKind::TestSkipped {
                 stress_index,
                 test_instance,
@@ -1504,14 +1480,6 @@ impl<'a> DisplayReporterImpl<'a> {
 
                     for entry in &*self.final_outputs {
                         match &entry.output {
-                            FinalOutput::Cached => {
-                                self.write_cached_line(
-                                    entry.stress_index,
-                                    entry.counter,
-                                    entry.instance,
-                                    writer,
-                                )?;
-                            }
                             FinalOutput::Skipped(_) => {
                                 self.write_skip_line(entry.stress_index, entry.instance, writer)?;
                             }
@@ -1576,21 +1544,6 @@ impl<'a> DisplayReporterImpl<'a> {
         }
 
         Ok(())
-    }
-
-    fn write_cached_line(
-        &self,
-        stress_index: Option<StressIndex>,
-        counter: TestInstanceCounter,
-        test_instance: TestInstanceId<'a>,
-        writer: &mut dyn WriteStr,
-    ) -> io::Result<()> {
-        write!(writer, "{:>12} ", "CACHED".style(self.styles.skip))?;
-        writeln!(
-            writer,
-            "[         ] {}",
-            self.display_test_instance(stress_index, counter, test_instance)
-        )
     }
 
     fn write_skip_line(
@@ -3615,45 +3568,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_status_has_no_execution_duration() {
-        let binary_id = RustBinaryId::new("test-binary");
-        let test_name = TestCaseName::new("cached_test");
-        let mut out = String::new();
-
-        with_reporter_at_status_level(
-            |mut reporter| {
-                reporter
-                    .write_event(&TestEvent {
-                        timestamp: Local::now().into(),
-                        elapsed: Duration::ZERO,
-                        kind: TestEventKind::TestCached {
-                            stress_index: None,
-                            test_instance: TestInstanceId {
-                                binary_id: &binary_id,
-                                test_name: &test_name,
-                            },
-                            current_stats: RunStats {
-                                initial_run_count: 1,
-                                finished_count: 1,
-                                cached: 1,
-                                ..RunStats::default()
-                            },
-                            running: 0,
-                        },
-                    })
-                    .unwrap();
-            },
-            &mut out,
-            StatusLevel::Pass,
-        );
-
-        assert!(out.contains("CACHED"), "output was: {out:?}");
-        assert!(!out.contains("PASS"), "output was: {out:?}");
-        assert!(!out.contains("0.000"), "output was: {out:?}");
-        assert!(out.contains("[         ]"), "output was: {out:?}");
-    }
-
-    #[test]
     fn test_summary_line() {
         let run_id = ReportUuid::nil();
         let mut out = String::new();
@@ -3671,7 +3585,6 @@ mod tests {
                     setup_scripts_exec_failed: 0,
                     setup_scripts_timed_out: 0,
                     passed: 5,
-                    cached: 0,
                     passed_slow: 0,
                     passed_timed_out: 0,
                     flaky: 0,
@@ -3710,7 +3623,6 @@ mod tests {
                     setup_scripts_exec_failed: 0,
                     setup_scripts_timed_out: 0,
                     passed: 5,
-                    cached: 0,
                     passed_slow: 1,
                     passed_timed_out: 2,
                     flaky: 1,
@@ -3802,7 +3714,6 @@ mod tests {
                     setup_scripts_exec_failed: 0,
                     setup_scripts_timed_out: 0,
                     passed: 0,
-                    cached: 0,
                     passed_slow: 0,
                     passed_timed_out: 0,
                     flaky: 0,
@@ -3870,7 +3781,6 @@ mod tests {
                                 setup_scripts_exec_failed: 0,
                                 setup_scripts_timed_out: 0,
                                 passed: 17,
-                                cached: 0,
                                 passed_slow: 4,
                                 passed_timed_out: 3,
                                 flaky: 2,

@@ -1,81 +1,210 @@
 // Copyright (c) The nextest Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A reference run-scoped cache-provider wrapper for nextest.
+//! An ordinary run-wrapper that caches successful nextest test executions.
 
+mod cache;
 mod error;
-mod passthrough;
-mod provider;
+mod exit_status;
 mod store;
 
-use crate::error::CacheError;
-use nextest_runner::cache_protocol::{
-    CACHE_OPERATION_COMMIT, CACHE_OPERATION_ENV, CACHE_OPERATION_PREPARE, CACHE_PROTOCOL_ENV,
-    CACHE_PROTOCOL_V1, CommitRequest, PrepareRequest,
+use crate::{
+    cache::{ATTEMPT_ENV, RUN_ID_ENV, STRESS_CURRENT_ENV},
+    error::CacheError,
+    store::CacheStore,
 };
-use serde::de::DeserializeOwned;
-use std::{env, ffi::OsString, io, process::ExitCode};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    process::{Command, ExitCode, ExitStatus},
+};
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    let command = match ChildCommand::parse(env::args_os().skip(1).collect()) {
+        Ok(command) => command,
+        Err(error) => return report_fatal(error),
+    };
+
+    let prepared = prepare_cache(&command);
+    if prepared.as_ref().is_some_and(|cache| cache.hit) {
+        return ExitCode::SUCCESS;
+    }
+
+    let status = match command.status() {
+        Ok(status) => status,
         Err(error) => {
-            eprintln!("nextest-cache: {error}");
-            ExitCode::FAILURE
+            if let Some(cache) = &prepared {
+                warn_cache_update(cache.store.invalidate(&cache.token));
+            }
+            return report_fatal(CacheError::io(
+                format!("failed to execute the child program {:?}", command.program),
+                error,
+            ));
         }
+    };
+
+    if let Some(cache) = prepared {
+        let update = if status.success() && cache.mode == CacheMode::FirstAttempt {
+            cache.store.store_clean_pass(&cache.token)
+        } else {
+            cache.store.invalidate(&cache.token)
+        };
+        warn_cache_update(update);
+    }
+
+    exit_status::exit(status)
+}
+
+#[derive(Debug)]
+struct ChildCommand {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+impl ChildCommand {
+    fn parse(mut args: Vec<OsString>) -> Result<Self, CacheError> {
+        if args.first().is_some_and(|arg| arg == "--") {
+            args.remove(0);
+        }
+        let mut args = args.into_iter();
+        let program = args.next().ok_or_else(|| {
+            CacheError::InvalidInvocation("the wrapper requires a child program".to_owned())
+        })?;
+        Ok(Self {
+            program,
+            args: args.collect(),
+        })
+    }
+
+    fn command_line(&self) -> Vec<OsString> {
+        let mut command = Vec::with_capacity(self.args.len() + 1);
+        command.push(self.program.clone());
+        command.extend(self.args.iter().cloned());
+        command
+    }
+
+    fn status(&self) -> Result<ExitStatus, std::io::Error> {
+        Command::new(&self.program).args(&self.args).status()
     }
 }
 
-fn run() -> Result<(), CacheError> {
-    let args: Vec<OsString> = env::args_os().skip(1).collect();
-    let protocol = env::var_os(CACHE_PROTOCOL_ENV);
-    let operation = env::var_os(CACHE_OPERATION_ENV);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheMode {
+    FirstAttempt,
+    Retry,
+}
 
-    match (protocol, operation) {
-        (None, None) => {
-            let mut args = args.into_iter();
-            let program = args.next().ok_or_else(|| {
-                CacheError::InvalidInvocation(
-                    "ordinary wrapper mode requires a child program".to_owned(),
-                )
-            })?;
-            passthrough::run(program, args.collect())
+impl CacheMode {
+    fn from_environment() -> Option<Self> {
+        if env::var_os(STRESS_CURRENT_ENV).is_some_and(|value| value != "none") {
+            return None;
         }
-        (Some(protocol), Some(operation)) => {
-            if protocol != CACHE_PROTOCOL_V1 {
-                return Err(CacheError::InvalidInvocation(format!(
-                    "unsupported value for {CACHE_PROTOCOL_ENV}: {protocol:?}"
-                )));
+        match env::var(ATTEMPT_ENV) {
+            Ok(attempt) if attempt == "1" => Some(Self::FirstAttempt),
+            Ok(attempt) if attempt.parse::<u32>().is_ok_and(|attempt| attempt > 1) => {
+                Some(Self::Retry)
             }
-            if !args.is_empty() {
-                return Err(CacheError::InvalidInvocation(
-                    "the reference provider does not accept configured wrapper arguments"
-                        .to_owned(),
+            Ok(attempt) => {
+                warn(format!(
+                    "{ATTEMPT_ENV} has unsupported value {attempt:?}; running without caching"
                 ));
+                None
             }
-
-            if operation == CACHE_OPERATION_PREPARE {
-                let request: PrepareRequest = read_request()?;
-                write_response(&provider::prepare(request)?)
-            } else if operation == CACHE_OPERATION_COMMIT {
-                let request: CommitRequest = read_request()?;
-                provider::commit(request)
-            } else {
-                Err(CacheError::InvalidInvocation(format!(
-                    "unsupported value for {CACHE_OPERATION_ENV}: {operation:?}"
-                )))
+            Err(_) => {
+                warn(format!(
+                    "{ATTEMPT_ENV} is not set to a valid nextest attempt; running without caching"
+                ));
+                None
             }
         }
-        _ => Err(CacheError::InvalidInvocation(format!(
-            "{CACHE_PROTOCOL_ENV} and {CACHE_OPERATION_ENV} must either both be set or both be absent"
-        ))),
     }
 }
 
-fn read_request<T: DeserializeOwned>() -> Result<T, CacheError> {
-    serde_json::from_reader(io::stdin().lock()).map_err(CacheError::DeserializeRequest)
+#[derive(Debug)]
+struct PreparedCache {
+    store: CacheStore,
+    token: String,
+    mode: CacheMode,
+    hit: bool,
 }
 
-fn write_response(response: &impl serde::Serialize) -> Result<(), CacheError> {
-    serde_json::to_writer(io::stdout().lock(), response).map_err(CacheError::SerializeResponse)
+fn prepare_cache(command: &ChildCommand) -> Option<PreparedCache> {
+    let mode = CacheMode::from_environment()?;
+    let run_id = match env::var_os(RUN_ID_ENV) {
+        Some(run_id) if !run_id.as_encoded_bytes().is_empty() => run_id,
+        _ => {
+            warn(format!(
+                "{RUN_ID_ENV} is missing or empty; running without caching"
+            ));
+            return None;
+        }
+    };
+    match try_prepare_cache(command, &run_id, mode) {
+        Ok(prepared) => Some(prepared),
+        Err(error) => {
+            warn(format!(
+                "cache access failed: {error}; running without caching"
+            ));
+            None
+        }
+    }
+}
+
+fn try_prepare_cache(
+    command: &ChildCommand,
+    run_id: &OsStr,
+    mode: CacheMode,
+) -> Result<PreparedCache, CacheError> {
+    let cwd = env::current_dir()
+        .map_err(|error| CacheError::io("failed to determine the current directory", error))?;
+    let command_line = command.command_line();
+    let artifact = cache::find_artifact(&command_line, &cwd).ok_or_else(|| {
+        CacheError::InvalidInvocation(
+            "the child command does not contain one unambiguous `--exact` test invocation"
+                .to_owned(),
+        )
+    })?;
+    let store = CacheStore::discover()?;
+    let artifact_digest = store.load_or_hash_for_run(run_id, &artifact)?;
+    if artifact_digest.was_hashed {
+        cache::trace_artifact_hash(&artifact, &artifact_digest.bytes);
+    }
+    let token = cache::derive_token(
+        &artifact_digest.bytes,
+        &command_line,
+        &cwd,
+        &cache::effective_environment(),
+    );
+
+    if mode == CacheMode::Retry {
+        warn_cache_update(store.invalidate(&token));
+        return Ok(PreparedCache {
+            store,
+            token,
+            mode,
+            hit: false,
+        });
+    }
+    let hit = store.contains_clean_pass(&token)?;
+    Ok(PreparedCache {
+        store,
+        token,
+        mode,
+        hit,
+    })
+}
+
+fn warn_cache_update(result: Result<(), CacheError>) {
+    if let Err(error) = result {
+        warn(format!("failed to update the cache: {error}"));
+    }
+}
+
+fn warn(message: impl std::fmt::Display) {
+    eprintln!("nextest-cache: warning: {message}");
+}
+
+fn report_fatal(error: CacheError) -> ExitCode {
+    eprintln!("nextest-cache: {error}");
+    ExitCode::FAILURE
 }

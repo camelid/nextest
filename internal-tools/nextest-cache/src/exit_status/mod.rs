@@ -13,4 +13,4 @@ mod imp;
 #[path = "other.rs"]
 mod imp;
 
-pub(crate) use imp::run;
+pub(crate) use imp::exit;

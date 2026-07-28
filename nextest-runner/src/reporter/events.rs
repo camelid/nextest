@@ -310,21 +310,6 @@ pub enum TestEventKind<'a> {
         running: usize,
     },
 
-    /// A cached test result was reused.
-    TestCached {
-        /// If a stress test is being run, the stress index, starting from 0.
-        stress_index: Option<StressIndex>,
-
-        /// The test instance whose cached result was reused.
-        test_instance: TestInstanceId<'a>,
-
-        /// Current statistics for number of tests so far.
-        current_stats: RunStats,
-
-        /// The number of tests that are currently running.
-        running: usize,
-    },
-
     /// A test was skipped.
     TestSkipped {
         /// If a stress test is being run, the stress index, starting from 0.
@@ -591,21 +576,17 @@ impl RunFinishedStats {
     }
 }
 
-fn usize_is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
 /// Statistics for a test run.
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 pub struct RunStats {
-    /// The total number of tests that were expected to produce results at the beginning.
+    /// The total number of tests that were expected to be run at the beginning.
     ///
     /// If the test run is cancelled, this will be more than `finished_count` at the end.
     pub initial_run_count: usize,
 
-    /// The total number of tests with final results, including cached results.
+    /// The total number of tests that finished running.
     pub finished_count: usize,
 
     /// The total number of setup scripts that were expected to be run at the beginning.
@@ -629,12 +610,8 @@ pub struct RunStats {
     pub setup_scripts_timed_out: usize,
 
     /// The number of tests that passed. Includes `passed_slow`, `passed_timed_out`, `flaky`, and
-    /// `leaky`, but does not include cached results.
+    /// `leaky`.
     pub passed: usize,
-
-    /// The number of cached successful test results.
-    #[serde(default, skip_serializing_if = "usize_is_zero")]
-    pub cached: usize,
 
     /// The number of slow tests that passed.
     pub passed_slow: usize,
@@ -767,11 +744,6 @@ impl RunStats {
                 self.setup_scripts_timed_out += 1;
             }
         }
-    }
-
-    pub(crate) fn on_test_cached(&mut self) {
-        self.finished_count += 1;
-        self.cached += 1;
     }
 
     pub(crate) fn on_test_finished(&mut self, run_statuses: &ExecutionStatuses<LiveSpec>) {
@@ -3272,21 +3244,6 @@ mod tests {
         };
         stats.on_test_finished(statuses);
         stats
-    }
-
-    #[test]
-    fn on_test_cached_is_not_an_executed_pass() {
-        let mut stats = RunStats {
-            initial_run_count: 1,
-            ..RunStats::default()
-        };
-
-        stats.on_test_cached();
-
-        assert_eq!(stats.finished_count, 1);
-        assert_eq!(stats.cached, 1);
-        assert_eq!(stats.passed, 0);
-        assert_eq!(stats.summarize_final(), FinalRunStats::Success);
     }
 
     #[test]

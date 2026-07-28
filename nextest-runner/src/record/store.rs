@@ -592,10 +592,8 @@ impl RecordedRunStatus {
 pub struct CompletedRunStats {
     /// The number of tests that were expected to run.
     pub initial_run_count: usize,
-    /// The number of tests that passed by executing.
+    /// The number of tests that passed.
     pub passed: usize,
-    /// The number of successful test results reused from the cache.
-    pub cached: usize,
     /// The number of tests that failed (including exec failures and timeouts).
     pub failed: usize,
     /// The exit code from the run.

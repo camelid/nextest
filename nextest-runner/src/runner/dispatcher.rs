@@ -466,7 +466,6 @@ where
             sub_run_duration_nanos: sub_elapsed.as_nanos() as u64,
             total_tests: self.run_stats.initial_run_count,
             passed: self.run_stats.passed,
-            cached: self.run_stats.cached,
             failed: self.run_stats.failed_count(),
             skipped: self.run_stats.skipped,
         });
@@ -654,22 +653,6 @@ where
                 } else {
                     HandleEventResponse::None
                 }
-            }
-            InternalEvent::Executor(ExecutorEvent::Cached { test }) => {
-                if self.run_stats.cancel_reason.is_some() {
-                    // The run has been cancelled: don't consume additional hits.
-                    return HandleEventResponse::None;
-                }
-
-                let test_instance = test.instance;
-                self.rerun_cx.mark_seen(test_instance.id());
-                self.run_stats.on_test_cached();
-                self.callback_none_response(TestEventKind::TestCached {
-                    stress_index: None,
-                    test_instance: test_instance.id(),
-                    current_stats: self.run_stats,
-                    running: self.running(),
-                })
             }
             InternalEvent::Executor(ExecutorEvent::Started {
                 stress_index,
@@ -1158,7 +1141,6 @@ where
             profile_name: self.profile_name.clone(),
             total_tests: self.run_stats.initial_run_count,
             passed: self.run_stats.passed,
-            cached: self.run_stats.cached,
             failed: self.run_stats.failed_count(),
             skipped: self.run_stats.skipped,
             duration_nanos: stopwatch_end.active.as_nanos() as u64,

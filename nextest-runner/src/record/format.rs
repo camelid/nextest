@@ -238,7 +238,7 @@ impl fmt::Display for StoreVersionIncompatibility {
 // ---
 
 /// The current format version for runs.json.zst.
-pub(super) const RUNS_JSON_FORMAT_VERSION: RunsJsonFormatVersion = RunsJsonFormatVersion::new(3);
+pub(super) const RUNS_JSON_FORMAT_VERSION: RunsJsonFormatVersion = RunsJsonFormatVersion::new(2);
 
 /// The current format version for recorded test runs (store.zip and run.log).
 ///
@@ -251,10 +251,9 @@ pub(super) const RUNS_JSON_FORMAT_VERSION: RunsJsonFormatVersion = RunsJsonForma
 /// - 1.1: Addition of the `flaky_result` field to `ExecutionStatuses`.
 /// - 2.0: `slot_assignment` is now mandatory in `TestStarted` and
 ///   `TestRetryStarted` events.
-/// - 2.1: Addition of `TestCached` events and cached-result statistics.
 pub const STORE_FORMAT_VERSION: StoreFormatVersion = StoreFormatVersion::new(
     StoreFormatMajorVersion::new(2),
-    StoreFormatMinorVersion::new(1),
+    StoreFormatMinorVersion::new(0),
 );
 
 /// Testing-only environment variable to force a specific store format version
@@ -495,10 +494,6 @@ impl From<RecordedSizesFormat> for RecordedSizes {
     }
 }
 
-fn usize_is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
 /// Status of a recorded run (serialization format).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
@@ -510,11 +505,8 @@ pub(super) enum RecordedRunStatusFormat {
     Completed {
         /// The number of tests that were expected to run.
         initial_run_count: usize,
-        /// The number of tests that passed by executing.
+        /// The number of tests that passed.
         passed: usize,
-        /// The number of successful test results reused from the cache.
-        #[serde(default, skip_serializing_if = "usize_is_zero")]
-        cached: usize,
         /// The number of tests that failed.
         failed: usize,
         /// The exit code from the run.
@@ -525,11 +517,8 @@ pub(super) enum RecordedRunStatusFormat {
     Cancelled {
         /// The number of tests that were expected to run.
         initial_run_count: usize,
-        /// The number of tests that passed by executing.
+        /// The number of tests that passed.
         passed: usize,
-        /// The number of successful test results reused from the cache.
-        #[serde(default, skip_serializing_if = "usize_is_zero")]
-        cached: usize,
         /// The number of tests that failed.
         failed: usize,
         /// The exit code from the run.
@@ -617,26 +606,22 @@ impl From<RecordedRunStatusFormat> for RecordedRunStatus {
             RecordedRunStatusFormat::Completed {
                 initial_run_count,
                 passed,
-                cached,
                 failed,
                 exit_code,
             } => Self::Completed(CompletedRunStats {
                 initial_run_count,
                 passed,
-                cached,
                 failed,
                 exit_code,
             }),
             RecordedRunStatusFormat::Cancelled {
                 initial_run_count,
                 passed,
-                cached,
                 failed,
                 exit_code,
             } => Self::Cancelled(CompletedRunStats {
                 initial_run_count,
                 passed,
-                cached,
                 failed,
                 exit_code,
             }),
@@ -674,14 +659,12 @@ impl From<&RecordedRunStatus> for RecordedRunStatusFormat {
             RecordedRunStatus::Completed(stats) => Self::Completed {
                 initial_run_count: stats.initial_run_count,
                 passed: stats.passed,
-                cached: stats.cached,
                 failed: stats.failed,
                 exit_code: stats.exit_code,
             },
             RecordedRunStatus::Cancelled(stats) => Self::Cancelled {
                 initial_run_count: stats.initial_run_count,
                 passed: stats.passed,
-                cached: stats.cached,
                 failed: stats.failed,
                 exit_code: stats.exit_code,
             },
@@ -1225,8 +1208,7 @@ mod tests {
     fn test_recorded_run_serialize_completed() {
         let run = make_test_run(RecordedRunStatusFormat::Completed {
             initial_run_count: 100,
-            passed: 85,
-            cached: 10,
+            passed: 95,
             failed: 5,
             exit_code: 0,
         });
@@ -1239,7 +1221,6 @@ mod tests {
         let run = make_test_run(RecordedRunStatusFormat::Cancelled {
             initial_run_count: 100,
             passed: 45,
-            cached: 0,
             failed: 5,
             exit_code: 100,
         });
@@ -1310,8 +1291,7 @@ mod tests {
     fn test_recorded_run_roundtrip() {
         let original = make_test_run(RecordedRunStatusFormat::Completed {
             initial_run_count: 100,
-            passed: 85,
-            cached: 10,
+            passed: 95,
             failed: 5,
             exit_code: 0,
         });
@@ -1329,29 +1309,11 @@ mod tests {
         match info.status {
             RecordedRunStatus::Completed(stats) => {
                 assert_eq!(stats.initial_run_count, 100);
-                assert_eq!(stats.passed, 85);
-                assert_eq!(stats.cached, 10);
+                assert_eq!(stats.passed, 95);
                 assert_eq!(stats.failed, 5);
             }
             _ => panic!("expected Completed variant"),
         }
-    }
-
-    #[test]
-    fn completed_status_without_cached_count_defaults_to_zero() {
-        let json = r#"{
-            "status": "completed",
-            "initial-run-count": 1,
-            "passed": 1,
-            "failed": 0,
-            "exit-code": 0
-        }"#;
-        let status: RecordedRunStatusFormat =
-            serde_json::from_str(json).expect("old completed status should deserialize");
-        let RecordedRunStatus::Completed(stats) = RecordedRunStatus::from(status) else {
-            panic!("expected completed status");
-        };
-        assert_eq!(stats.cached, 0);
     }
 
     // --- Store format version tests ---
@@ -1366,7 +1328,6 @@ mod tests {
 
     #[test]
     fn test_store_version_compatibility() {
-        assert_eq!(STORE_FORMAT_VERSION, version(2, 1));
         assert!(
             version(1, 0).check_readable_by(version(1, 0)).is_ok(),
             "same version should be compatible"
