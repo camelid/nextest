@@ -9,7 +9,7 @@ mod exit_status;
 mod store;
 
 use crate::{
-    cache::{ATTEMPT_ENV, RUN_ID_ENV, STRESS_CURRENT_ENV},
+    cache::{ATTEMPT_ENV, DISABLE_ENV, RUN_ID_ENV, STRESS_CURRENT_ENV},
     error::CacheError,
     store::CacheStore,
 };
@@ -96,6 +96,9 @@ enum CacheMode {
 
 impl CacheMode {
     fn from_environment() -> Option<Self> {
+        if env::var_os(DISABLE_ENV).is_some() {
+            return None;
+        }
         if env::var_os(STRESS_CURRENT_ENV).is_some_and(|value| value != "none") {
             return None;
         }

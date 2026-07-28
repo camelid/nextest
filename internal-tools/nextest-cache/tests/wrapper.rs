@@ -128,6 +128,26 @@ fn retry_and_stress_attempts_bypass_caching() {
 }
 
 #[test]
+fn explicit_disable_bypasses_caching() {
+    let fixture = Fixture::new();
+    assert!(fixture.run("run-1", "fixture_child").success());
+    assert_eq!(fixture.executions(), 1);
+
+    assert!(
+        fixture
+            .command("run-2", "fixture_child")
+            .env("NEXTEST_CACHE_DISABLE", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 2);
+
+    assert!(fixture.run("run-3", "fixture_child").success());
+    assert_eq!(fixture.executions(), 2);
+}
+
+#[test]
 fn cache_infrastructure_failures_execute_the_child() {
     let fixture = Fixture::new();
     assert!(

@@ -16,6 +16,7 @@ use xxhash_rust::xxh3::Xxh3;
 pub(crate) const RUN_ID_ENV: &str = "NEXTEST_RUN_ID";
 pub(crate) const ATTEMPT_ENV: &str = "NEXTEST_ATTEMPT";
 pub(crate) const STRESS_CURRENT_ENV: &str = "NEXTEST_STRESS_CURRENT";
+pub(crate) const DISABLE_ENV: &str = "NEXTEST_CACHE_DISABLE";
 pub(crate) const TRACE_ENV: &str = "NEXTEST_CACHE_TRACE";
 
 const KEY_DOMAIN: &[u8] = b"nextest-wrapper-cache-key-v1";
