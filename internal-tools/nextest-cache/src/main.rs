@@ -11,7 +11,7 @@ mod store;
 use crate::{
     cache::{ATTEMPT_ENV, DISABLE_ENV, RUN_ID_ENV, STRESS_CURRENT_ENV},
     error::CacheError,
-    store::CacheStore,
+    store::{CacheStore, RunLease},
 };
 use std::{
     env,
@@ -129,6 +129,7 @@ struct PreparedCache {
     token: String,
     mode: CacheMode,
     hit: bool,
+    _run_lease: RunLease,
 }
 
 fn prepare_cache(command: &ChildCommand) -> Option<PreparedCache> {
@@ -186,6 +187,7 @@ fn try_prepare_cache(
             token,
             mode,
             hit: false,
+            _run_lease: artifact_digest.run_lease,
         });
     }
     let hit = store.contains_clean_pass(&token)?;
@@ -194,6 +196,7 @@ fn try_prepare_cache(
         token,
         mode,
         hit,
+        _run_lease: artifact_digest.run_lease,
     })
 }
 

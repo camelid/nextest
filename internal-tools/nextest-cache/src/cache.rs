@@ -19,7 +19,7 @@ pub(crate) const STRESS_CURRENT_ENV: &str = "NEXTEST_STRESS_CURRENT";
 pub(crate) const DISABLE_ENV: &str = "NEXTEST_CACHE_DISABLE";
 pub(crate) const TRACE_ENV: &str = "NEXTEST_CACHE_TRACE";
 
-const KEY_DOMAIN: &[u8] = b"nextest-wrapper-cache-key-v1";
+const KEY_DOMAIN: &[u8] = b"nextest-wrapper-cache-key";
 pub(crate) type CacheDigest = [u8; 16];
 const FILTERED_ENVIRONMENT: [&str; 9] = [
     RUN_ID_ENV,
@@ -206,7 +206,7 @@ mod tests {
             "/cwd",
             &environment(),
         );
-        assert_eq!(base, "58756024a1647423021f63901b1bbbc8");
+        assert_eq!(base, "16d45b172876d76f1d3d1c961112cc8d");
         assert_ne!(
             base,
             token(

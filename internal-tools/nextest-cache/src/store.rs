@@ -23,25 +23,31 @@ use xxhash_rust::xxh3::Xxh3;
 
 pub(crate) const CACHE_DIR_ENV: &str = "NEXTEST_CACHE_DIR";
 const STORAGE_DIR: &str = "storage";
-const ENTRY_VERSION: u32 = 1;
-const RUN_HASH_VERSION: u32 = 1;
-const RUN_ID_DOMAIN: &[u8] = b"nextest-wrapper-cache-run-id-v1";
-const ARTIFACT_PATH_DOMAIN: &[u8] = b"nextest-wrapper-cache-artifact-path-v1";
+const RUN_ID_DOMAIN: &[u8] = b"nextest-wrapper-cache-run-id";
+const ARTIFACT_PATH_DOMAIN: &[u8] = b"nextest-wrapper-cache-artifact-path";
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INITIAL_INTERVAL: Duration = Duration::from_millis(1);
 const LOCK_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(10);
-const RUN_HASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const ENTRY_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const RUN_HASH_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub(crate) struct CacheStore {
     root: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct ArtifactDigest {
     pub(crate) bytes: CacheDigest,
     pub(crate) was_hashed: bool,
+    pub(crate) run_lease: RunLease,
+}
+
+#[derive(Debug)]
+pub(crate) struct RunLease {
+    _file: File,
 }
 
 impl CacheStore {
@@ -83,26 +89,20 @@ impl CacheStore {
         let Ok(entry) = serde_json::from_slice::<CacheEntry>(&bytes) else {
             return Ok(false);
         };
-        Ok(entry.version == ENTRY_VERSION)
+        Ok(entry.clean_pass)
     }
 
     pub(crate) fn store_clean_pass(&self, token: &str) -> Result<(), CacheError> {
         validate_token(token)?;
-        self.with_lock(&self.entry_lock_path(token), "the cache entry lock", || {
+        self.with_entry_lock(token, || {
             let path = self.entry_path(token);
-            atomic_write_json(
-                &path,
-                &CacheEntry {
-                    version: ENTRY_VERSION,
-                },
-                "the cache entry",
-            )
+            atomic_write_json(&path, &CacheEntry { clean_pass: true }, "the cache entry")
         })
     }
 
     pub(crate) fn invalidate(&self, token: &str) -> Result<(), CacheError> {
         validate_token(token)?;
-        self.with_lock(&self.entry_lock_path(token), "the cache entry lock", || {
+        self.with_entry_lock(token, || {
             let path = self.entry_path(token);
             match fs::remove_file(&path) {
                 Ok(()) => Ok(()),
@@ -122,11 +122,11 @@ impl CacheStore {
     ) -> Result<ArtifactDigest, CacheError> {
         let run_token = domain_digest(RUN_ID_DOMAIN, run_id);
         let artifact_token = domain_digest(ARTIFACT_PATH_DOMAIN, artifact.as_os_str());
-        let _run_lease = self.acquire_run_lease(&run_token)?;
+        let run_lease = self.acquire_run_lease(&run_token)?;
         self.ensure_run_directory(&run_token)?;
         self.touch_run_directory(&run_token)?;
 
-        self.with_lock(
+        let (bytes, was_hashed) = self.with_lock(
             &self.run_hash_lock_path(&run_token, &artifact_token),
             "the per-run artifact lock",
             || {
@@ -137,10 +137,7 @@ impl CacheStore {
                 {
                     let identity_after = metadata_identity(artifact)?;
                     if identity_after == current_identity {
-                        return Ok(ArtifactDigest {
-                            bytes: digest,
-                            was_hashed: false,
-                        });
+                        return Ok((digest, false));
                     }
                 }
 
@@ -148,19 +145,20 @@ impl CacheStore {
                 atomic_write_json(
                     &memo_path,
                     &RunHashMemo {
-                        version: RUN_HASH_VERSION,
                         artifact_path_digest: artifact_token,
                         artifact_identity: identity,
                         xxh3_128: hex::encode(digest),
                     },
                     "the per-run artifact hash memo",
                 )?;
-                Ok(ArtifactDigest {
-                    bytes: digest,
-                    was_hashed: true,
-                })
+                Ok((digest, true))
             },
-        )
+        )?;
+        Ok(ArtifactDigest {
+            bytes,
+            was_hashed,
+            run_lease,
+        })
     }
 
     fn ensure_run_directory(&self, run_token: &str) -> Result<(), CacheError> {
@@ -176,7 +174,7 @@ impl CacheStore {
         })?;
         let run_directory = run_hashes.join(run_token);
         match fs::create_dir(&run_directory) {
-            Ok(()) => self.prune_run_hashes(run_token),
+            Ok(()) => self.prune_storage(run_token),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(CacheError::io(
@@ -191,23 +189,36 @@ impl CacheStore {
         Ok(())
     }
 
-    fn prune_run_hashes(&self, current_run_token: &str) {
-        self.prune_run_hashes_older_than(current_run_token, RUN_HASH_RETENTION);
-    }
-
-    fn prune_run_hashes_older_than(&self, current_run_token: &str, retention: Duration) {
-        let Ok(gate) = self.open_lock_file(&self.run_hash_prune_lock_path()) else {
+    fn prune_storage(&self, current_run_token: &str) {
+        let Ok(gate) = self.open_lock_file(&self.prune_lock_path()) else {
             return;
         };
         if gate.try_lock().is_err() {
             return;
         }
 
+        let now = SystemTime::now();
+        let pruning_is_due = gate
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= PRUNE_INTERVAL);
+        if !pruning_is_due {
+            return;
+        }
+
+        self.prune_run_hashes(current_run_token, now);
+        self.prune_entries(now);
+        self.prune_orphan_entry_locks(now);
+        let _ = gate.set_modified(now);
+    }
+
+    fn prune_run_hashes(&self, current_run_token: &str, now: SystemTime) {
         let run_hashes = self.root.join("run-hashes");
         let Ok(entries) = fs::read_dir(&run_hashes) else {
             return;
         };
-        let now = SystemTime::now();
         for entry in entries.flatten() {
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -229,10 +240,69 @@ impl CacheStore {
             };
             if now
                 .duration_since(modified)
-                .is_ok_and(|age| age >= retention)
+                .is_ok_and(|age| age >= RUN_HASH_RETENTION)
             {
                 self.try_prune_run_hash(entry.file_name(), entry.path());
             }
+        }
+    }
+
+    fn prune_entries(&self, now: SystemTime) {
+        let entries_root = self.root.join("entries");
+        let Ok(prefixes) = fs::read_dir(&entries_root) else {
+            return;
+        };
+        for prefix in prefixes.flatten() {
+            if !prefix.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(prefix.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(token) = cache_token_from_path(&path, "json") else {
+                    continue;
+                };
+                if !entry_is_expired(&entry, now) {
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(self.entry_lock_path(token));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        let _ = fs::remove_file(self.entry_lock_path(token));
+                    }
+                    Err(_) => {}
+                }
+            }
+            let _ = fs::remove_dir(prefix.path());
+        }
+    }
+
+    fn prune_orphan_entry_locks(&self, now: SystemTime) {
+        let locks_root = self.root.join("locks").join("entries");
+        let Ok(prefixes) = fs::read_dir(&locks_root) else {
+            return;
+        };
+        for prefix in prefixes.flatten() {
+            if !prefix.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                continue;
+            }
+            let Ok(locks) = fs::read_dir(prefix.path()) else {
+                continue;
+            };
+            for lock in locks.flatten() {
+                let path = lock.path();
+                let Some(token) = cache_token_from_path(&path, "lock") else {
+                    continue;
+                };
+                if !self.entry_path(token).exists() && entry_is_expired(&lock, now) {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            let _ = fs::remove_dir(prefix.path());
         }
     }
 
@@ -279,13 +349,27 @@ impl CacheStore {
         let _ = fs::remove_file(lease_path);
     }
 
-    fn acquire_run_lease(&self, run_token: &str) -> Result<File, CacheError> {
-        let gate = self.open_lock_file(&self.run_hash_prune_lock_path())?;
-        acquire_shared_lock(&gate, "the run-hash lifecycle gate", LOCK_TIMEOUT)?;
+    fn acquire_run_lease(&self, run_token: &str) -> Result<RunLease, CacheError> {
+        let gate = self.open_lock_file(&self.prune_lock_path())?;
+        acquire_shared_lock(&gate, "the cache lifecycle gate", LOCK_TIMEOUT)?;
 
         let lease = self.open_lock_file(&self.run_hash_lease_path(OsStr::new(run_token)))?;
         acquire_shared_lock(&lease, "the run-hash lease", LOCK_TIMEOUT)?;
-        Ok(lease)
+        Ok(RunLease { _file: lease })
+    }
+
+    fn with_entry_lock<T>(
+        &self,
+        token: &str,
+        operation: impl FnOnce() -> Result<T, CacheError>,
+    ) -> Result<T, CacheError> {
+        let gate = self.open_lock_file(&self.prune_lock_path())?;
+        acquire_shared_lock(&gate, "the cache lifecycle gate", LOCK_TIMEOUT)?;
+        self.with_lock(
+            &self.entry_lock_path(token),
+            "the cache entry lock",
+            operation,
+        )
     }
 
     fn with_lock<T>(
@@ -360,8 +444,8 @@ impl CacheStore {
             .join(format!("{artifact_token}.lock"))
     }
 
-    fn run_hash_prune_lock_path(&self) -> PathBuf {
-        self.root.join("locks").join("run-hash-prune.lock")
+    fn prune_lock_path(&self) -> PathBuf {
+        self.root.join("locks").join("prune.lock")
     }
 
     fn run_hash_lease_path(&self, run_token: &OsStr) -> PathBuf {
@@ -371,6 +455,25 @@ impl CacheStore {
             .join(run_token)
             .with_extension("lock")
     }
+}
+
+fn cache_token_from_path<'a>(path: &'a Path, extension: &str) -> Option<&'a str> {
+    if path.extension()? != extension {
+        return None;
+    }
+    let token = path.file_stem()?.to_str()?;
+    validate_token(token).ok()?;
+    Some(token)
+}
+
+fn entry_is_expired(entry: &fs::DirEntry, now: SystemTime) -> bool {
+    entry.file_type().is_ok_and(|file_type| file_type.is_file())
+        && entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= ENTRY_RETENTION)
 }
 
 fn read_run_hash_memo(
@@ -391,10 +494,7 @@ fn read_run_hash_memo(
     let Ok(memo) = serde_json::from_slice::<RunHashMemo>(&bytes) else {
         return Ok(None);
     };
-    if memo.version != RUN_HASH_VERSION
-        || memo.artifact_path_digest != artifact_token
-        || memo.artifact_identity != *identity
-    {
+    if memo.artifact_path_digest != artifact_token || memo.artifact_identity != *identity {
         return Ok(None);
     }
     let Ok(digest) = hex::decode(memo.xxh3_128) else {
@@ -568,13 +668,12 @@ fn validate_token(token: &str) -> Result<(), CacheError> {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct CacheEntry {
-    version: u32,
+    clean_pass: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct RunHashMemo {
-    version: u32,
     artifact_path_digest: String,
     artifact_identity: ArtifactIdentity,
     xxh3_128: String,
@@ -644,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_and_unknown_entries_are_misses() {
+    fn corrupt_and_non_pass_entries_are_misses() {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
         let path = store.entry_path(TOKEN);
@@ -652,7 +751,7 @@ mod tests {
 
         fs::write(&path, b"not json").unwrap();
         assert!(!store.contains_clean_pass(TOKEN).unwrap());
-        fs::write(&path, br#"{"version":999}"#).unwrap();
+        fs::write(&path, br#"{"clean-pass":false}"#).unwrap();
         assert!(!store.contains_clean_pass(TOKEN).unwrap());
     }
 
@@ -677,7 +776,7 @@ mod tests {
             match fs::read(store.entry_path(TOKEN)) {
                 Ok(bytes) => {
                     let entry: CacheEntry = serde_json::from_slice(&bytes).unwrap();
-                    assert_eq!(entry.version, ENTRY_VERSION);
+                    assert!(entry.clean_pass);
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => panic!("failed to read an entry: {error}"),
@@ -833,6 +932,49 @@ mod tests {
     }
 
     #[test]
+    fn pruning_removes_expired_entries_and_locks() {
+        let temp = camino_tempfile::tempdir().unwrap();
+        let store = CacheStore::from_root(temp.path().into());
+        store.store_clean_pass(TOKEN).unwrap();
+
+        let entry_path = store.entry_path(TOKEN);
+        let entry_lock_path = store.entry_lock_path(TOKEN);
+        set_modified_to_epoch(&entry_path);
+        set_modified_to_epoch(&entry_lock_path);
+        set_modified_to_epoch(&store.prune_lock_path());
+        store.prune_storage("current-run");
+        assert!(!entry_path.exists());
+        assert!(!entry_lock_path.exists());
+        assert!(!entry_path.parent().unwrap().exists());
+        assert!(!entry_lock_path.parent().unwrap().exists());
+
+        let orphan_token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let orphan_lock_path = store.entry_lock_path(orphan_token);
+        drop(store.open_lock_file(&orphan_lock_path).unwrap());
+        set_modified_to_epoch(&orphan_lock_path);
+        set_modified_to_epoch(&store.prune_lock_path());
+        store.prune_storage("current-run");
+        assert!(!orphan_lock_path.exists());
+        assert!(!orphan_lock_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn pruning_is_throttled() {
+        let temp = camino_tempfile::tempdir().unwrap();
+        let store = CacheStore::from_root(temp.path().into());
+        store.store_clean_pass(TOKEN).unwrap();
+        let entry_path = store.entry_path(TOKEN);
+        set_modified_to_epoch(&entry_path);
+
+        store.prune_storage("current-run");
+        assert!(entry_path.exists());
+
+        set_modified_to_epoch(&store.prune_lock_path());
+        store.prune_storage("current-run");
+        assert!(!entry_path.exists());
+    }
+
+    #[test]
     fn pruning_does_not_remove_a_leased_run() {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
@@ -841,16 +983,27 @@ mod tests {
         let old_run = domain_digest(RUN_ID_DOMAIN, OsStr::new("old-run"));
         let current_run = domain_digest(RUN_ID_DOMAIN, OsStr::new("current-run"));
 
-        store
+        let digest = store
             .load_or_hash_for_run(OsStr::new("old-run"), artifact.as_std_path())
             .unwrap();
-        let lease = store.acquire_run_lease(&old_run).unwrap();
-        store.prune_run_hashes_older_than(&current_run, Duration::ZERO);
+        set_modified_to_epoch(&store.run_hash_last_used_path(OsStr::new(&old_run)));
+        set_modified_to_epoch(&store.prune_lock_path());
+        store.prune_storage(&current_run);
         assert!(store.root.join("run-hashes").join(&old_run).is_dir());
 
-        drop(lease);
-        store.prune_run_hashes_older_than(&current_run, Duration::ZERO);
+        drop(digest);
+        set_modified_to_epoch(&store.prune_lock_path());
+        store.prune_storage(&current_run);
         assert!(!store.root.join("run-hashes").join(&old_run).exists());
         assert!(!store.run_hash_lease_path(OsStr::new(&old_run)).exists());
+    }
+
+    fn set_modified_to_epoch(path: &Path) {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
     }
 }
