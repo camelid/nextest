@@ -6,7 +6,7 @@
 use crate::error::CacheError;
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use etcetera::{BaseStrategy, choose_base_strategy};
-use nextest_runner::cache_protocol::{CommitDisposition, CommitUpdate};
+use nextest_runner::cache_protocol::{CommitAction, CommitUpdate};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -75,18 +75,14 @@ impl CacheStore {
         validate_updates(updates)?;
 
         let mut failures = Vec::new();
-        for disposition in [CommitDisposition::Invalidate, CommitDisposition::CleanPass] {
-            for update in updates
-                .iter()
-                .filter(|update| update.disposition == disposition)
-            {
-                let result = match disposition {
-                    CommitDisposition::Invalidate => self.invalidate(&update.token),
-                    CommitDisposition::CleanPass => self.store_clean_pass(&update.token),
-                    CommitDisposition::Hit => unreachable!("hits are not persisted"),
+        for action in [CommitAction::Invalidate, CommitAction::Store] {
+            for update in updates.iter().filter(|update| update.action == action) {
+                let result = match action {
+                    CommitAction::Invalidate => self.invalidate(&update.token),
+                    CommitAction::Store => self.store_clean_pass(&update.token),
                 };
                 if let Err(error) = result {
-                    failures.push(format!("test ID {}: {error}", update.test_id));
+                    failures.push(format!("token {}: {error}", update.token));
                 }
             }
         }
@@ -206,26 +202,13 @@ fn acquire_lock(file: &File) -> Result<(), CacheError> {
 }
 
 fn validate_updates(updates: &[CommitUpdate]) -> Result<(), CacheError> {
-    let mut test_ids = HashSet::with_capacity(updates.len());
     let mut tokens = HashSet::with_capacity(updates.len());
     for update in updates {
-        if !test_ids.insert(update.test_id) {
-            return Err(CacheError::InvalidRequest(format!(
-                "duplicate commit test ID {}",
-                update.test_id
-            )));
-        }
         validate_token(&update.token)?;
         if !tokens.insert(update.token.as_str()) {
             return Err(CacheError::InvalidRequest(format!(
                 "duplicate commit token {}",
                 update.token
-            )));
-        }
-        if update.execution.effect_ledger.is_some() {
-            return Err(CacheError::InvalidRequest(format!(
-                "test ID {} included an effect ledger unsupported by protocol version 1",
-                update.test_id
             )));
         }
     }
@@ -255,21 +238,18 @@ struct CacheEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextest_runner::cache_protocol::{CacheExecutionData, CommitUpdate};
     use std::sync::{Arc, Barrier};
 
     const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    fn update(disposition: CommitDisposition) -> CommitUpdate {
-        update_for(1, TOKEN, disposition)
+    fn update(action: CommitAction) -> CommitUpdate {
+        update_for(TOKEN, action)
     }
 
-    fn update_for(test_id: u64, token: &str, disposition: CommitDisposition) -> CommitUpdate {
+    fn update_for(token: &str, action: CommitAction) -> CommitUpdate {
         CommitUpdate {
-            test_id,
             token: token.to_owned(),
-            disposition,
-            execution: CacheExecutionData::default(),
+            action,
         }
     }
 
@@ -279,12 +259,10 @@ mod tests {
         let store = CacheStore::from_root(temp.path().into());
 
         assert!(!store.contains_valid(TOKEN).unwrap());
-        store
-            .apply_updates(&[update(CommitDisposition::CleanPass)])
-            .unwrap();
+        store.apply_updates(&[update(CommitAction::Store)]).unwrap();
         assert!(store.contains_valid(TOKEN).unwrap());
         store
-            .apply_updates(&[update(CommitDisposition::Invalidate)])
+            .apply_updates(&[update(CommitAction::Invalidate)])
             .unwrap();
         assert!(!store.contains_valid(TOKEN).unwrap());
     }
@@ -313,9 +291,7 @@ mod tests {
             let barrier = barrier.clone();
             threads.push(thread::spawn(move || {
                 barrier.wait();
-                store
-                    .apply_updates(&[update(CommitDisposition::CleanPass)])
-                    .unwrap();
+                store.apply_updates(&[update(CommitAction::Store)]).unwrap();
             }));
         }
         for thread in threads {
@@ -332,11 +308,7 @@ mod tests {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
         store
-            .apply_updates(&[update_for(
-                2,
-                INVALIDATED_TOKEN,
-                CommitDisposition::CleanPass,
-            )])
+            .apply_updates(&[update_for(INVALIDATED_TOKEN, CommitAction::Store)])
             .unwrap();
         assert!(store.contains_valid(INVALIDATED_TOKEN).unwrap());
 
@@ -348,8 +320,8 @@ mod tests {
 
         let error = store
             .apply_updates(&[
-                update_for(1, TOKEN, CommitDisposition::CleanPass),
-                update_for(2, INVALIDATED_TOKEN, CommitDisposition::Invalidate),
+                update_for(TOKEN, CommitAction::Store),
+                update_for(INVALIDATED_TOKEN, CommitAction::Invalidate),
             ])
             .unwrap_err();
 
@@ -361,13 +333,12 @@ mod tests {
     fn validation_happens_before_any_update() {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
-        let mut invalid = update(CommitDisposition::CleanPass);
-        invalid.test_id = 2;
+        let mut invalid = update(CommitAction::Store);
         invalid.token = "invalid".to_owned();
 
         assert!(
             store
-                .apply_updates(&[update(CommitDisposition::CleanPass), invalid])
+                .apply_updates(&[update(CommitAction::Store), invalid])
                 .is_err()
         );
         assert!(!store.contains_valid(TOKEN).unwrap());

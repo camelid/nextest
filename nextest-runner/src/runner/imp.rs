@@ -373,7 +373,6 @@ impl TestRunnerBuilder {
                     test_threads,
                     self.capture_strategy,
                     self.retries,
-                    self.flaky_result,
                     self.expected_outstanding.is_none(),
                 )
             } else {

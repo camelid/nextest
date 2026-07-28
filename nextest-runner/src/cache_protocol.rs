@@ -3,18 +3,27 @@
 
 //! Wire types for the experimental nextest cache-provider protocol.
 //!
-//! Cache providers are run-scoped wrapper scripts. Nextest invokes the provider
-//! before the run to prepare decisions, invokes it normally around cache misses,
-//! and invokes it after the run to commit authoritative outcomes.
+//! A provider receives resolved test commands before scheduling, returns one
+//! decision per test in artifact-major request order, wraps misses normally,
+//! and receives authoritative outcomes after the run. Control invocations also
+//! receive `NEXTEST_PROFILE`, `NEXTEST_WORKSPACE_ROOT`, `NEXTEST_VERSION`,
+//! `NEXTEST_REQUIRED_VERSION`, `NEXTEST_RECOMMENDED_VERSION`,
+//! `NEXTEST_TEST_THREADS`, and [`CACHE_CAPTURE_STRATEGY_ENV`]. Provider failures
+//! disable caching for affected work rather than failing the test run. A
+//! successful commit process exit acknowledges the request; it has no response.
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The environment variable that selects the cache protocol version.
 pub const CACHE_PROTOCOL_ENV: &str = "NEXTEST_CACHE_PROTOCOL";
 
 /// The environment variable that selects a cache control-plane operation.
 pub const CACHE_OPERATION_ENV: &str = "NEXTEST_CACHE_OPERATION";
+
+/// The environment variable containing the run's output capture strategy.
+pub const CACHE_CAPTURE_STRATEGY_ENV: &str = "NEXTEST_CACHE_CAPTURE_STRATEGY";
 
 /// The environment variable containing the opaque token for a cache miss.
 pub const CACHE_TOKEN_ENV: &str = "NEXTEST_CACHE_TOKEN";
@@ -34,58 +43,22 @@ pub const MAX_CACHE_TOKEN_LEN: usize = 4096;
 /// The maximum UTF-8 length of a provider bypass reason.
 pub const MAX_BYPASS_REASON_LEN: usize = 16 * 1024;
 
-/// A cache protocol version.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ProtocolVersion {
-    /// The incompatible protocol generation.
-    pub major: u32,
-
-    /// The backwards-compatible protocol revision.
-    pub minor: u32,
-}
-
-impl ProtocolVersion {
-    /// The version implemented by these wire types.
-    pub const V1: Self = Self { major: 1, minor: 0 };
-
-    /// Returns whether this version is compatible with version 1.
-    pub fn is_v1_compatible(self) -> bool {
-        self.major == Self::V1.major
-    }
-}
-
 /// A request to prepare cache decisions for a run.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PrepareRequest {
-    /// The protocol version used by nextest.
-    pub version: ProtocolVersion,
-
-    /// A provider-defined isolation namespace for this workspace.
-    pub namespace: String,
-
-    /// Whether existing entries may be consulted.
+    /// Whether the provider may reuse existing entries.
     pub consult: bool,
 
-    /// Whether nextest intends to commit outcomes after the run.
-    pub record: bool,
-
-    /// The test artifacts and tests considered for caching.
+    /// The executable artifacts containing selected tests.
     pub artifacts: Vec<ArtifactRequest>,
 }
 
-/// A test artifact whose contents contribute to cache tokens.
+/// An executable artifact and the selected tests within it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ArtifactRequest {
-    /// An invocation-local artifact identifier.
-    pub artifact_id: u64,
-
-    /// Nextest's stable binary identifier.
-    pub binary_id: String,
-
-    /// The path to the executable artifact.
+    /// The executable path. Providers decide how to fingerprint it.
     pub path: Utf8PathBuf,
 
     /// Tests selected from this artifact.
@@ -96,137 +69,111 @@ pub struct ArtifactRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TestRequest {
-    /// An invocation-local test identifier.
-    pub test_id: u64,
+    /// The resolved command that would execute this test.
+    pub command: CommandSpec,
 
-    /// The test name.
-    pub test_name: String,
+    /// Stable runner inputs not represented by the command itself.
+    ///
+    /// Providers own cache-key policy and may use any or all of these values.
+    pub context: BTreeMap<String, String>,
+}
 
-    /// An opaque, deterministic description of nextest execution semantics.
-    pub execution_key: String,
+/// A resolved test command supplied as cache-key input.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommandSpec {
+    /// The program to execute.
+    pub program: String,
+
+    /// Arguments passed to the program.
+    pub args: Vec<String>,
+
+    /// The command's working directory.
+    pub cwd: Utf8PathBuf,
+
+    /// Explicit environment changes applied by nextest.
+    pub environment: Vec<EnvironmentVariable>,
+}
+
+/// One explicit command environment change.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EnvironmentVariable {
+    /// The environment variable name.
+    pub name: PlatformString,
+
+    /// The value to set, or `None` to remove the variable.
+    pub value: Option<PlatformString>,
+}
+
+/// A lossless platform-native string.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "encoding", content = "units", rename_all = "kebab-case")]
+pub enum PlatformString {
+    /// Unix bytes.
+    Unix(Vec<u8>),
+
+    /// Windows UTF-16 code units.
+    Windows(Vec<u16>),
 }
 
 /// A provider's response to a prepare request.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PrepareResponse {
-    /// The protocol version used by the provider.
-    pub version: ProtocolVersion,
-
-    /// Exactly one decision for each submitted test.
+    /// One decision per requested test, traversing `artifacts` and each
+    /// artifact's `tests` in vector order.
     pub decisions: Vec<PrepareDecision>,
 }
 
-/// A provider decision for a selected test.
+/// A provider decision for one requested test.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum PrepareDecision {
-    /// A clean cached result may be consumed without executing the test.
-    Hit {
-        /// The invocation-local test identifier.
-        test_id: u64,
-
-        /// An opaque token identifying the cache entry.
-        token: String,
-    },
+    /// A successful cached result may be consumed without execution.
+    Hit,
 
     /// The test must execute and may be committed afterward.
     Miss {
-        /// The invocation-local test identifier.
-        test_id: u64,
-
-        /// An opaque token identifying the cache entry.
+        /// An opaque token identifying the provider's cache entry. It must be
+        /// unique within this response.
         token: String,
     },
 
     /// The provider cannot safely cache this test in this invocation.
     Bypass {
-        /// The invocation-local test identifier.
-        test_id: u64,
-
-        /// A bounded, human-readable diagnostic.
+        /// A bounded human-readable diagnostic.
         reason: String,
     },
 }
 
-impl PrepareDecision {
-    /// Returns the invocation-local test identifier for this decision.
-    pub fn test_id(&self) -> u64 {
-        match self {
-            Self::Hit { test_id, .. }
-            | Self::Miss { test_id, .. }
-            | Self::Bypass { test_id, .. } => *test_id,
-        }
-    }
-}
-
-/// A request to commit outcomes after a run.
+/// A request to commit authoritative outcomes after a run.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CommitRequest {
-    /// The protocol version used by nextest.
-    pub version: ProtocolVersion,
-
-    /// Authoritative outcome updates produced during the run.
+    /// Cache-entry updates for misses that produced final results. A miss with
+    /// no final result is omitted.
     pub updates: Vec<CommitUpdate>,
 }
 
-/// A provider's response to a commit request.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct CommitResponse {
-    /// The protocol version used by the provider.
-    pub version: ProtocolVersion,
-}
-
-/// An authoritative outcome update for one test.
+/// An authoritative update for one opaque provider token.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CommitUpdate {
-    /// The invocation-local test identifier from the prepare request.
-    pub test_id: u64,
-
-    /// The opaque token returned by the provider.
+    /// The opaque token returned for the cache miss.
     pub token: String,
 
-    /// How the provider should update this token.
-    pub disposition: CommitDisposition,
-
-    /// Optional execution data reserved for protocol extensions.
-    pub execution: CacheExecutionData,
+    /// The update to apply.
+    pub action: CommitAction,
 }
 
-/// How a provider should update an entry after nextest classifies the result.
+/// An authoritative cache-entry update.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum CommitDisposition {
-    /// Nextest consumed an existing cache hit.
-    Hit,
+pub enum CommitAction {
+    /// Store an ordinary pass that completed in exactly one attempt.
+    Store,
 
-    /// The test had one ordinary passing attempt and is safe to store.
-    CleanPass,
-
-    /// Any existing entry must be invalidated.
+    /// Invalidate after any other final execution outcome.
     Invalidate,
-}
-
-/// Execution data that can refine cache eligibility in future revisions.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct CacheExecutionData {
-    /// A future description of effects observed while executing the test.
-    ///
-    /// Version 1 requires this to be `None`.
-    pub effect_ledger: Option<EffectLedgerEnvelope>,
-}
-
-/// A versioned envelope reserved for a future effect ledger.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct EffectLedgerEnvelope {
-    /// The ledger format understood by the provider.
-    pub format: String,
-
-    /// Provider-specific ledger data.
-    pub data: serde_json::Value,
 }

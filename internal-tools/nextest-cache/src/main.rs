@@ -59,7 +59,7 @@ fn run() -> Result<(), CacheError> {
                 write_response(&provider::prepare(request)?)
             } else if operation == CACHE_OPERATION_COMMIT {
                 let request: CommitRequest = read_request()?;
-                write_response(&provider::commit(request)?)
+                provider::commit(request)
             } else {
                 Err(CacheError::InvalidInvocation(format!(
                     "unsupported value for {CACHE_OPERATION_ENV}: {operation:?}"

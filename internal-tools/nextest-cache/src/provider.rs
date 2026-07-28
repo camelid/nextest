@@ -6,13 +6,13 @@
 use crate::{error::CacheError, store::CacheStore};
 use camino::Utf8Path;
 use nextest_runner::cache_protocol::{
-    ArtifactRequest, CommitRequest, CommitResponse, MAX_BYPASS_REASON_LEN, PrepareDecision,
-    PrepareRequest, PrepareResponse, ProtocolVersion,
+    ArtifactRequest, CACHE_CAPTURE_STRATEGY_ENV, CommandSpec, CommitRequest, MAX_BYPASS_REASON_LEN,
+    PrepareDecision, PrepareRequest, PrepareResponse, TestRequest,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::BTreeMap,
     env,
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
@@ -21,145 +21,124 @@ use std::{
 
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_NAMESPACE_LEN: usize = 1024 * 1024;
-const MAX_EXECUTION_KEY_LEN: usize = 4 * 1024 * 1024;
+const MAX_KEY_INPUT_LEN: usize = 4 * 1024 * 1024;
 const TRACE_ENV: &str = "NEXTEST_CACHE_TRACE";
+const GLOBAL_KEY_ENV: [&str; 5] = [
+    CACHE_CAPTURE_STRATEGY_ENV,
+    "NEXTEST_REQUIRED_VERSION",
+    "NEXTEST_RECOMMENDED_VERSION",
+    "NEXTEST_TEST_THREADS",
+    "NEXTEST_VERSION",
+];
+const WORKSPACE_ROOT_ENV: &str = "NEXTEST_WORKSPACE_ROOT";
 
 pub(crate) fn prepare(request: PrepareRequest) -> Result<PrepareResponse, CacheError> {
+    let namespace = env::var(WORKSPACE_ROOT_ENV).map_err(|_| {
+        CacheError::InvalidInvocation(format!("{WORKSPACE_ROOT_ENV} must contain valid UTF-8"))
+    })?;
+    let global_context = GLOBAL_KEY_ENV
+        .into_iter()
+        .map(|name| {
+            env::var(name)
+                .map(|value| (name.to_owned(), value))
+                .map_err(|_| {
+                    CacheError::InvalidInvocation(format!(
+                        "{name} must be set and contain valid UTF-8"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
     let store = CacheStore::discover()?;
-    prepare_with_hasher(request, &store, |artifact| {
-        let digest = hash_artifact(&artifact.path)?;
-        trace_artifact_hash(artifact, &digest);
-        Ok(digest)
-    })
+    prepare_with_hasher(
+        request,
+        &store,
+        namespace.as_bytes(),
+        &global_context,
+        |artifact| {
+            let digest = hash_artifact(&artifact.path)?;
+            trace_artifact_hash(artifact, &digest);
+            Ok(digest)
+        },
+    )
 }
 
-pub(crate) fn commit(request: CommitRequest) -> Result<CommitResponse, CacheError> {
-    if !request.version.is_v1_compatible() {
-        return Err(CacheError::InvalidRequest(format!(
-            "unsupported protocol version {:?}",
-            request.version
-        )));
-    }
-    let store = CacheStore::discover()?;
-    store.apply_updates(&request.updates)?;
-    Ok(CommitResponse {
-        version: ProtocolVersion::V1,
-    })
+pub(crate) fn commit(request: CommitRequest) -> Result<(), CacheError> {
+    CacheStore::discover()?.apply_updates(&request.updates)
 }
 
 fn prepare_with_hasher(
     request: PrepareRequest,
     store: &CacheStore,
+    namespace: &[u8],
+    global_context: &BTreeMap<String, String>,
     mut hash: impl FnMut(&ArtifactRequest) -> Result<[u8; 32], CacheError>,
 ) -> Result<PrepareResponse, CacheError> {
-    validate_prepare_request(&request)?;
+    validate_prepare_request(&request, namespace)?;
 
     let mut decisions = Vec::new();
     for artifact in &request.artifacts {
         match hash(artifact) {
             Ok(artifact_digest) => {
                 for test in &artifact.tests {
-                    let token = derive_token(
-                        request.namespace.as_bytes(),
-                        &artifact_digest,
-                        test.execution_key.as_bytes(),
-                    );
-                    let decision = if request.consult {
-                        match store.contains_valid(&token) {
-                            Ok(true) => PrepareDecision::Hit {
-                                test_id: test.test_id,
-                                token,
+                    let decision =
+                        match derive_token(namespace, &artifact_digest, global_context, test) {
+                            Ok(token) if request.consult => match store.contains_valid(&token) {
+                                Ok(true) => PrepareDecision::Hit,
+                                Ok(false) => PrepareDecision::Miss { token },
+                                Err(error) => PrepareDecision::Bypass {
+                                    reason: bounded_reason(format!(
+                                        "failed to consult cache entry: {error}"
+                                    )),
+                                },
                             },
-                            Ok(false) => PrepareDecision::Miss {
-                                test_id: test.test_id,
-                                token,
-                            },
+                            Ok(token) => PrepareDecision::Miss { token },
                             Err(error) => PrepareDecision::Bypass {
-                                test_id: test.test_id,
-                                reason: bounded_reason(format!(
-                                    "failed to consult cache entry: {error}"
-                                )),
+                                reason: bounded_reason(error.to_string()),
                             },
-                        }
-                    } else {
-                        PrepareDecision::Miss {
-                            test_id: test.test_id,
-                            token,
-                        }
-                    };
+                        };
                     decisions.push(decision);
                 }
             }
             Err(error) => {
                 let reason = bounded_reason(format!("failed to hash artifact: {error}"));
-                decisions.extend(artifact.tests.iter().map(|test| PrepareDecision::Bypass {
-                    test_id: test.test_id,
+                decisions.extend(artifact.tests.iter().map(|_| PrepareDecision::Bypass {
                     reason: reason.clone(),
                 }));
             }
         }
     }
 
-    Ok(PrepareResponse {
-        version: ProtocolVersion::V1,
-        decisions,
-    })
+    Ok(PrepareResponse { decisions })
 }
 
-fn validate_prepare_request(request: &PrepareRequest) -> Result<(), CacheError> {
-    if !request.version.is_v1_compatible() {
+fn validate_prepare_request(request: &PrepareRequest, namespace: &[u8]) -> Result<(), CacheError> {
+    if namespace.is_empty() || namespace.len() > MAX_NAMESPACE_LEN {
         return Err(CacheError::InvalidRequest(format!(
-            "unsupported protocol version {:?}",
-            request.version
-        )));
-    }
-    if request.namespace.is_empty() || request.namespace.len() > MAX_NAMESPACE_LEN {
-        return Err(CacheError::InvalidRequest(format!(
-            "namespace must contain between 1 and {MAX_NAMESPACE_LEN} bytes"
+            "the provider namespace must contain between 1 and {MAX_NAMESPACE_LEN} bytes"
         )));
     }
 
-    let mut artifact_ids = HashSet::with_capacity(request.artifacts.len());
-    let mut test_ids = HashSet::new();
     for artifact in &request.artifacts {
-        if !artifact_ids.insert(artifact.artifact_id) {
-            return Err(CacheError::InvalidRequest(format!(
-                "duplicate artifact ID {}",
-                artifact.artifact_id
-            )));
-        }
-        if artifact.binary_id.is_empty() {
-            return Err(CacheError::InvalidRequest(format!(
-                "artifact ID {} has an empty binary ID",
-                artifact.artifact_id
-            )));
-        }
         if artifact.path.as_str().is_empty() {
-            return Err(CacheError::InvalidRequest(format!(
-                "artifact ID {} has an empty path",
-                artifact.artifact_id
-            )));
+            return Err(CacheError::InvalidRequest(
+                "an artifact has an empty path".to_owned(),
+            ));
         }
         if artifact.tests.is_empty() {
             return Err(CacheError::InvalidRequest(format!(
-                "artifact ID {} has no tests",
-                artifact.artifact_id
+                "artifact {} has no tests",
+                artifact.path
             )));
         }
-
-        for test in &artifact.tests {
-            if !test_ids.insert(test.test_id) {
-                return Err(CacheError::InvalidRequest(format!(
-                    "duplicate test ID {}",
-                    test.test_id
-                )));
-            }
-            if test.execution_key.is_empty() || test.execution_key.len() > MAX_EXECUTION_KEY_LEN {
-                return Err(CacheError::InvalidRequest(format!(
-                    "test ID {} has an execution key outside the supported size range",
-                    test.test_id
-                )));
-            }
+        if artifact
+            .tests
+            .iter()
+            .any(|test| test.command.program.is_empty())
+        {
+            return Err(CacheError::InvalidRequest(format!(
+                "artifact {} has a test with an empty command",
+                artifact.path
+            )));
         }
     }
     Ok(())
@@ -240,13 +219,40 @@ fn hash_artifact(path: &Utf8Path) -> Result<[u8; 32], CacheError> {
     Ok(hasher.finalize().into())
 }
 
-fn derive_token(namespace: &[u8], artifact_digest: &[u8; 32], execution_key: &[u8]) -> String {
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ProviderKey<'a> {
+    format: &'static str,
+    command: &'a CommandSpec,
+    global_context: &'a BTreeMap<String, String>,
+    test_context: &'a BTreeMap<String, String>,
+}
+
+fn derive_token(
+    namespace: &[u8],
+    artifact_digest: &[u8; 32],
+    global_context: &BTreeMap<String, String>,
+    test: &TestRequest,
+) -> Result<String, CacheError> {
+    let key = serde_json::to_vec(&ProviderKey {
+        format: "nextest-reference-provider-key-v1",
+        command: &test.command,
+        global_context,
+        test_context: &test.context,
+    })
+    .map_err(CacheError::SerializeKey)?;
+    if key.len() > MAX_KEY_INPUT_LEN {
+        return Err(CacheError::InvalidRequest(format!(
+            "a test has more than {MAX_KEY_INPUT_LEN} bytes of cache-key input"
+        )));
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(b"nextest-cache-token-v1");
+    hasher.update(b"nextest-cache-token-v2");
     update_field(&mut hasher, namespace);
     update_field(&mut hasher, artifact_digest);
-    update_field(&mut hasher, execution_key);
-    hex::encode(hasher.finalize())
+    update_field(&mut hasher, &key);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn update_field(hasher: &mut Sha256, value: &[u8]) {
@@ -270,8 +276,6 @@ fn bounded_reason(mut reason: String) -> String {
 #[serde(rename_all = "kebab-case")]
 struct TraceArtifactHash<'a> {
     event: &'static str,
-    artifact_id: u64,
-    binary_id: &'a str,
     path: &'a Utf8Path,
     sha256: String,
 }
@@ -282,8 +286,6 @@ fn trace_artifact_hash(artifact: &ArtifactRequest, digest: &[u8; 32]) {
     };
     let event = TraceArtifactHash {
         event: "artifact-hashed",
-        artifact_id: artifact.artifact_id,
-        binary_id: &artifact.binary_id,
         path: &artifact.path,
         sha256: hex::encode(digest),
     };
@@ -314,31 +316,33 @@ fn trace_artifact_hash(artifact: &ArtifactRequest, digest: &[u8; 32]) {
 mod tests {
     use super::*;
     use nextest_runner::cache_protocol::{
-        ArtifactRequest, CacheExecutionData, CommitDisposition, CommitUpdate, TestRequest,
+        CommandSpec, CommitAction, CommitUpdate, EnvironmentVariable,
     };
     use std::{cell::Cell, fs};
 
-    fn request(path: &Utf8Path, execution_keys: &[&str], consult: bool) -> PrepareRequest {
+    fn request(path: &Utf8Path, keys: &[&str], consult: bool) -> PrepareRequest {
         PrepareRequest {
-            version: ProtocolVersion::V1,
-            namespace: "workspace".to_owned(),
             consult,
-            record: true,
             artifacts: vec![ArtifactRequest {
-                artifact_id: 7,
-                binary_id: "binary".to_owned(),
                 path: path.to_owned(),
-                tests: execution_keys
+                tests: keys
                     .iter()
-                    .enumerate()
-                    .map(|(index, key)| TestRequest {
-                        test_id: index as u64,
-                        test_name: format!("test-{index}"),
-                        execution_key: (*key).to_owned(),
+                    .map(|key| TestRequest {
+                        command: CommandSpec {
+                            program: "wrapper".to_owned(),
+                            args: vec![(*key).to_owned()],
+                            cwd: "/workspace".into(),
+                            environment: Vec::<EnvironmentVariable>::new(),
+                        },
+                        context: BTreeMap::new(),
                     })
                     .collect(),
             }],
         }
+    }
+
+    fn global_context() -> BTreeMap<String, String> {
+        BTreeMap::from([("nextest-version".to_owned(), "test".to_owned())])
     }
 
     #[test]
@@ -352,6 +356,8 @@ mod tests {
         let response = prepare_with_hasher(
             request(&artifact, &["key-1", "key-2"], true),
             &store,
+            b"workspace",
+            &global_context(),
             |_| {
                 hash_count.set(hash_count.get() + 1);
                 Ok([42; 32])
@@ -376,54 +382,77 @@ mod tests {
         fs::write(&artifact, b"artifact contents").unwrap();
         let store = CacheStore::from_root(temp.path().as_std_path().join("cache"));
 
-        let first =
-            prepare_with_hasher(request(&artifact, &["key"], true), &store, |_| Ok([1; 32]))
-                .unwrap();
-        let PrepareDecision::Miss { test_id, token } = &first.decisions[0] else {
+        let first = prepare_with_hasher(
+            request(&artifact, &["key"], true),
+            &store,
+            b"workspace",
+            &global_context(),
+            |_| Ok([1; 32]),
+        )
+        .unwrap();
+        let PrepareDecision::Miss { token, .. } = &first.decisions[0] else {
             panic!("first decision should be a miss");
         };
         store
             .apply_updates(&[CommitUpdate {
-                test_id: *test_id,
                 token: token.clone(),
-                disposition: CommitDisposition::CleanPass,
-                execution: CacheExecutionData::default(),
+                action: CommitAction::Store,
             }])
             .unwrap();
 
-        let second =
-            prepare_with_hasher(request(&artifact, &["key"], true), &store, |_| Ok([1; 32]))
-                .unwrap();
-        assert!(matches!(second.decisions[0], PrepareDecision::Hit { .. }));
+        let second = prepare_with_hasher(
+            request(&artifact, &["key"], true),
+            &store,
+            b"workspace",
+            &global_context(),
+            |_| Ok([1; 32]),
+        )
+        .unwrap();
+        assert!(matches!(second.decisions[0], PrepareDecision::Hit));
 
         store
             .apply_updates(&[CommitUpdate {
-                test_id: *test_id,
                 token: token.clone(),
-                disposition: CommitDisposition::Invalidate,
-                execution: CacheExecutionData::default(),
+                action: CommitAction::Invalidate,
             }])
             .unwrap();
-        let third =
-            prepare_with_hasher(request(&artifact, &["key"], true), &store, |_| Ok([1; 32]))
-                .unwrap();
+        let third = prepare_with_hasher(
+            request(&artifact, &["key"], true),
+            &store,
+            b"workspace",
+            &global_context(),
+            |_| Ok([1; 32]),
+        )
+        .unwrap();
         assert!(matches!(third.decisions[0], PrepareDecision::Miss { .. }));
     }
 
     #[test]
-    fn execution_key_changes_the_token() {
+    fn provider_key_inputs_change_the_token() {
         let temp = camino_tempfile::tempdir().unwrap();
         let artifact = temp.path().join("artifact");
         fs::write(&artifact, b"artifact contents").unwrap();
         let store = CacheStore::from_root(temp.path().as_std_path().join("cache"));
 
-        let first = prepare_with_hasher(request(&artifact, &["before"], false), &store, |_| {
-            Ok([3; 32])
-        })
+        let first = prepare_with_hasher(
+            request(&artifact, &["before"], false),
+            &store,
+            b"workspace",
+            &global_context(),
+            |_| Ok([3; 32]),
+        )
         .unwrap();
-        let second = prepare_with_hasher(request(&artifact, &["after"], false), &store, |_| {
-            Ok([3; 32])
-        })
+        let mut changed_context = request(&artifact, &["before"], false);
+        changed_context.artifacts[0].tests[0]
+            .context
+            .insert("setting".to_owned(), "changed".to_owned());
+        let second = prepare_with_hasher(
+            changed_context,
+            &store,
+            b"workspace",
+            &global_context(),
+            |_| Ok([3; 32]),
+        )
         .unwrap();
         let PrepareDecision::Miss { token: first, .. } = &first.decisions[0] else {
             panic!("expected a miss");
@@ -432,6 +461,21 @@ mod tests {
             panic!("expected a miss");
         };
         assert_ne!(first, second);
+
+        let mut changed_global_context = global_context();
+        changed_global_context.insert("nextest-version".to_owned(), "changed".to_owned());
+        let third = prepare_with_hasher(
+            request(&artifact, &["before"], false),
+            &store,
+            b"workspace",
+            &changed_global_context,
+            |_| Ok([3; 32]),
+        )
+        .unwrap();
+        let PrepareDecision::Miss { token: third, .. } = &third.decisions[0] else {
+            panic!("expected a miss");
+        };
+        assert_ne!(first, third);
     }
 
     #[test]

@@ -15,6 +15,9 @@ pub(crate) enum CacheError {
     #[error("failed to deserialize protocol request: {0}")]
     DeserializeRequest(serde_json::Error),
 
+    #[error("failed to serialize cache-key input: {0}")]
+    SerializeKey(serde_json::Error),
+
     #[error("failed to serialize protocol response: {0}")]
     SerializeResponse(serde_json::Error),
 
