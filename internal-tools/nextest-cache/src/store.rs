@@ -3,11 +3,13 @@
 
 //! Persistent clean-pass entries and per-run artifact hash memos.
 
-use crate::{cache::domain_digest, error::CacheError};
+use crate::{
+    cache::{CacheDigest, domain_digest},
+    error::CacheError,
+};
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use etcetera::{BaseStrategy, choose_base_strategy};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -17,6 +19,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use xxhash_rust::xxh3::Xxh3;
 
 pub(crate) const CACHE_DIR_ENV: &str = "NEXTEST_CACHE_DIR";
 const STORAGE_VERSION_DIR: &str = "storage-v2";
@@ -26,7 +29,8 @@ const RUN_ID_DOMAIN: &[u8] = b"nextest-wrapper-cache-run-id-v1";
 const ARTIFACT_PATH_DOMAIN: &[u8] = b"nextest-wrapper-cache-artifact-path-v1";
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const LOCK_RETRY_INITIAL_INTERVAL: Duration = Duration::from_millis(1);
+const LOCK_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(10);
 const RUN_HASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Clone, Debug)]
@@ -36,7 +40,7 @@ pub(crate) struct CacheStore {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ArtifactDigest {
-    pub(crate) bytes: [u8; 32],
+    pub(crate) bytes: CacheDigest,
     pub(crate) was_hashed: bool,
 }
 
@@ -147,7 +151,7 @@ impl CacheStore {
                         version: RUN_HASH_VERSION,
                         artifact_path_digest: artifact_token,
                         artifact_identity: identity,
-                        sha256: hex::encode(digest),
+                        xxh3_128: hex::encode(digest),
                     },
                     "the per-run artifact hash memo",
                 )?;
@@ -373,7 +377,7 @@ fn read_run_hash_memo(
     path: &Path,
     artifact_token: &str,
     identity: &ArtifactIdentity,
-) -> Result<Option<[u8; 32]>, CacheError> {
+) -> Result<Option<CacheDigest>, CacheError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -393,20 +397,20 @@ fn read_run_hash_memo(
     {
         return Ok(None);
     }
-    let Ok(digest) = hex::decode(memo.sha256) else {
+    let Ok(digest) = hex::decode(memo.xxh3_128) else {
         return Ok(None);
     };
     Ok(digest.try_into().ok())
 }
 
-fn hash_artifact(path: &Path) -> Result<([u8; 32], ArtifactIdentity), CacheError> {
+fn hash_artifact(path: &Path) -> Result<(CacheDigest, ArtifactIdentity), CacheError> {
     hash_artifact_with(path, || {})
 }
 
 fn hash_artifact_with(
     path: &Path,
     after_read: impl FnOnce(),
-) -> Result<([u8; 32], ArtifactIdentity), CacheError> {
+) -> Result<(CacheDigest, ArtifactIdentity), CacheError> {
     let path_before = fs::metadata(path).map_err(|error| {
         CacheError::io(
             format!("failed to read artifact metadata for {}", path.display()),
@@ -433,7 +437,7 @@ fn hash_artifact_with(
         return Err(CacheError::ArtifactChanged);
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = Xxh3::new();
     let mut buffer = vec![0; HASH_BUFFER_SIZE];
     loop {
         let count = match file.read(&mut buffer) {
@@ -472,7 +476,7 @@ fn hash_artifact_with(
         return Err(CacheError::ArtifactChanged);
     }
 
-    Ok((hasher.finalize().into(), identity))
+    Ok((hasher.digest128().to_be_bytes(), identity))
 }
 
 fn metadata_identity(path: &Path) -> Result<ArtifactIdentity, CacheError> {
@@ -520,17 +524,22 @@ fn acquire_lock_with(
     try_lock: impl Fn(&File) -> Result<(), TryLockError>,
 ) -> Result<(), CacheError> {
     let started = Instant::now();
+    let mut retry_interval = LOCK_RETRY_INITIAL_INTERVAL;
     loop {
         match try_lock(file) {
             Ok(()) => return Ok(()),
             Err(TryLockError::WouldBlock) => {
-                if started.elapsed() >= timeout {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
                     return Err(CacheError::LockTimeout {
                         context: context.to_owned(),
                         timeout,
                     });
                 }
-                thread::sleep(LOCK_RETRY_INTERVAL.min(timeout));
+                thread::sleep(retry_interval.min(timeout - elapsed));
+                retry_interval = retry_interval
+                    .saturating_mul(2)
+                    .min(LOCK_RETRY_MAX_INTERVAL);
             }
             Err(TryLockError::Error(error)) => {
                 return Err(CacheError::io(
@@ -543,14 +552,14 @@ fn acquire_lock_with(
 }
 
 fn validate_token(token: &str) -> Result<(), CacheError> {
-    if token.len() != 64
+    if token.len() != 32
         || !token
             .as_bytes()
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
     {
         return Err(CacheError::InvalidInvocation(
-            "a cache token must be 64 lowercase hexadecimal characters".to_owned(),
+            "a cache token must be 32 lowercase hexadecimal characters".to_owned(),
         ));
     }
     Ok(())
@@ -568,7 +577,7 @@ struct RunHashMemo {
     version: u32,
     artifact_path_digest: String,
     artifact_identity: ArtifactIdentity,
-    sha256: String,
+    xxh3_128: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -619,7 +628,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
-    const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn clean_pass_hit_store_and_invalidate() {
@@ -843,5 +852,18 @@ mod tests {
         store.prune_run_hashes_older_than(&current_run, Duration::ZERO);
         assert!(!store.root.join("run-hashes").join(&old_run).exists());
         assert!(!store.run_hash_lease_path(OsStr::new(&old_run)).exists());
+    }
+
+    #[test]
+    fn pruning_removes_legacy_run_hashes() {
+        let temp = camino_tempfile::tempdir().unwrap();
+        let store = CacheStore::from_root(temp.path().into());
+        let legacy_run = "a".repeat(64);
+        let legacy_run_path = store.root.join("run-hashes").join(&legacy_run);
+        fs::create_dir_all(&legacy_run_path).unwrap();
+
+        store.prune_run_hashes_older_than("current-run", Duration::ZERO);
+
+        assert!(!legacy_run_path.exists());
     }
 }

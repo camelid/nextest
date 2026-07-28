@@ -4,7 +4,6 @@
 //! Cache-key derivation and wrapper command recognition.
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -12,6 +11,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+use xxhash_rust::xxh3::Xxh3;
 
 pub(crate) const RUN_ID_ENV: &str = "NEXTEST_RUN_ID";
 pub(crate) const ATTEMPT_ENV: &str = "NEXTEST_ATTEMPT";
@@ -19,6 +19,7 @@ pub(crate) const STRESS_CURRENT_ENV: &str = "NEXTEST_STRESS_CURRENT";
 pub(crate) const TRACE_ENV: &str = "NEXTEST_CACHE_TRACE";
 
 const KEY_DOMAIN: &[u8] = b"nextest-wrapper-cache-key-v1";
+pub(crate) type CacheDigest = [u8; 16];
 const FILTERED_ENVIRONMENT: [&str; 9] = [
     RUN_ID_ENV,
     "NEXTEST_ATTEMPT_ID",
@@ -62,7 +63,7 @@ pub(crate) fn effective_environment() -> Vec<(OsString, OsString)> {
 }
 
 pub(crate) fn derive_token(
-    artifact_digest: &[u8; 32],
+    artifact_digest: &CacheDigest,
     command: &[OsString],
     cwd: &Path,
     environment: &[(OsString, OsString)],
@@ -82,7 +83,7 @@ pub(crate) fn derive_token(
             })
     });
 
-    let mut hasher = Sha256::new();
+    let mut hasher = Xxh3::new();
     update_field(&mut hasher, KEY_DOMAIN);
     update_field(&mut hasher, artifact_digest);
     update_count(&mut hasher, command.len());
@@ -95,24 +96,24 @@ pub(crate) fn derive_token(
         update_field(&mut hasher, name.as_encoded_bytes());
         update_field(&mut hasher, value.as_encoded_bytes());
     }
-    hex::encode(hasher.finalize())
+    hex::encode(hasher.digest128().to_be_bytes())
 }
 
 pub(crate) fn domain_digest(domain: &[u8], value: &OsStr) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Xxh3::new();
     update_field(&mut hasher, domain);
     update_field(&mut hasher, value.as_encoded_bytes());
-    hex::encode(hasher.finalize())
+    hex::encode(hasher.digest128().to_be_bytes())
 }
 
-pub(crate) fn trace_artifact_hash(path: &Path, digest: &[u8; 32]) {
+pub(crate) fn trace_artifact_hash(path: &Path, digest: &CacheDigest) {
     let Some(trace_path) = env::var_os(TRACE_ENV) else {
         return;
     };
     let event = TraceArtifactHash {
         event: "artifact-hashed",
         path: path.to_string_lossy(),
-        sha256: hex::encode(digest),
+        xxh3_128: hex::encode(digest),
     };
     let mut line = match serde_json::to_vec(&event) {
         Ok(line) => line,
@@ -137,12 +138,12 @@ pub(crate) fn trace_artifact_hash(path: &Path, digest: &[u8; 32]) {
     }
 }
 
-fn update_count(hasher: &mut Sha256, count: usize) {
+fn update_count(hasher: &mut Xxh3, count: usize) {
     update_field(hasher, &(count as u64).to_be_bytes());
 }
 
-fn update_field(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_be_bytes());
+fn update_field(hasher: &mut Xxh3, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
 }
 
@@ -168,7 +169,7 @@ fn environment_name_eq(name: &OsStr, candidate: &str) -> bool {
 struct TraceArtifactHash<'a> {
     event: &'static str,
     path: std::borrow::Cow<'a, str>,
-    sha256: String,
+    xxh3_128: String,
 }
 
 #[cfg(test)]
@@ -183,7 +184,7 @@ mod tests {
     }
 
     fn token(
-        digest: [u8; 32],
+        digest: CacheDigest,
         command: &[&str],
         cwd: &str,
         environment: &[(OsString, OsString)],
@@ -199,19 +200,16 @@ mod tests {
     #[test]
     fn key_derivation_is_stable_and_sensitive_to_inputs() {
         let base = token(
-            [1; 32],
+            [1; 16],
             &["runner", "artifact", "--exact", "test"],
             "/cwd",
             &environment(),
         );
-        assert_eq!(
-            base,
-            "2d6a4be74f6a3b45873c69d413ff4a4f483a8c49192f158c9cc99acb92d0efe0"
-        );
+        assert_eq!(base, "58756024a1647423021f63901b1bbbc8");
         assert_ne!(
             base,
             token(
-                [2; 32],
+                [2; 16],
                 &["runner", "artifact", "--exact", "test"],
                 "/cwd",
                 &environment()
@@ -220,7 +218,7 @@ mod tests {
         assert_ne!(
             base,
             token(
-                [1; 32],
+                [1; 16],
                 &["runner", "artifact", "--exact", "other"],
                 "/cwd",
                 &environment()
@@ -229,7 +227,7 @@ mod tests {
         assert_ne!(
             base,
             token(
-                [1; 32],
+                [1; 16],
                 &["runner", "artifact", "--exact", "test"],
                 "/other",
                 &environment()
@@ -241,7 +239,7 @@ mod tests {
         assert_ne!(
             base,
             token(
-                [1; 32],
+                [1; 16],
                 &["runner", "artifact", "--exact", "test"],
                 "/cwd",
                 &changed_environment,
@@ -255,8 +253,8 @@ mod tests {
         let mut second = environment();
         second.reverse();
         assert_eq!(
-            token([1; 32], &["artifact"], "/cwd", &first),
-            token([1; 32], &["artifact"], "/cwd", &second),
+            token([1; 16], &["artifact"], "/cwd", &first),
+            token([1; 16], &["artifact"], "/cwd", &second),
         );
     }
 
@@ -267,8 +265,8 @@ mod tests {
             let mut with_control = environment();
             with_control.push((OsString::from(name), OsString::from("value")));
             assert_eq!(
-                token([1; 32], &["artifact"], "/cwd", &environment()),
-                token([1; 32], &["artifact"], "/cwd", &with_control),
+                token([1; 16], &["artifact"], "/cwd", &environment()),
+                token([1; 16], &["artifact"], "/cwd", &with_control),
                 "{name}",
             );
         }
@@ -316,14 +314,14 @@ mod tests {
             OsString::from_vec(vec![b'V', 0x81]),
         )];
 
-        let base = derive_token(&[0; 32], &command, Path::new("/cwd"), &environment);
+        let base = derive_token(&[0; 16], &command, Path::new("/cwd"), &environment);
         assert_ne!(
             base,
-            derive_token(&[0; 32], &changed_command, Path::new("/cwd"), &environment,)
+            derive_token(&[0; 16], &changed_command, Path::new("/cwd"), &environment,)
         );
         assert_ne!(
             base,
-            derive_token(&[0; 32], &command, Path::new("/cwd"), &changed_environment,)
+            derive_token(&[0; 16], &command, Path::new("/cwd"), &changed_environment,)
         );
     }
 }
