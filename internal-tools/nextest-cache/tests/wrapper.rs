@@ -156,7 +156,7 @@ fn cache_infrastructure_failures_execute_the_child() {
 fn corrupt_run_memos_are_replaced() {
     let fixture = Fixture::new();
     assert!(fixture.run("run-1", "fixture_child").success());
-    let memo = find_json_file(&fixture.cache.join("storage-v2/run-hashes"));
+    let memo = find_json_file(&fixture.cache.join("storage/run-hashes"));
     fs::write(memo, b"not json").unwrap();
 
     assert!(fixture.run("run-1", "fixture_child").success());

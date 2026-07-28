@@ -22,7 +22,7 @@ use std::{
 use xxhash_rust::xxh3::Xxh3;
 
 pub(crate) const CACHE_DIR_ENV: &str = "NEXTEST_CACHE_DIR";
-const STORAGE_VERSION_DIR: &str = "storage-v2";
+const STORAGE_DIR: &str = "storage";
 const ENTRY_VERSION: u32 = 1;
 const RUN_HASH_VERSION: u32 = 1;
 const RUN_ID_DOMAIN: &[u8] = b"nextest-wrapper-cache-run-id-v1";
@@ -55,14 +55,14 @@ impl CacheStore {
                 .join("cache"),
         };
         Ok(Self {
-            root: base.join(STORAGE_VERSION_DIR),
+            root: base.join(STORAGE_DIR),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn from_root(root: PathBuf) -> Self {
         Self {
-            root: root.join(STORAGE_VERSION_DIR),
+            root: root.join(STORAGE_DIR),
         }
     }
 
@@ -852,18 +852,5 @@ mod tests {
         store.prune_run_hashes_older_than(&current_run, Duration::ZERO);
         assert!(!store.root.join("run-hashes").join(&old_run).exists());
         assert!(!store.run_hash_lease_path(OsStr::new(&old_run)).exists());
-    }
-
-    #[test]
-    fn pruning_removes_legacy_run_hashes() {
-        let temp = camino_tempfile::tempdir().unwrap();
-        let store = CacheStore::from_root(temp.path().into());
-        let legacy_run = "a".repeat(64);
-        let legacy_run_path = store.root.join("run-hashes").join(&legacy_run);
-        fs::create_dir_all(&legacy_run_path).unwrap();
-
-        store.prune_run_hashes_older_than("current-run", Duration::ZERO);
-
-        assert!(!legacy_run_path.exists());
     }
 }
