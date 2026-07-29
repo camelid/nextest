@@ -7,10 +7,12 @@ use std::{
     process::{Command, ExitStatus},
 };
 
-const MARKER_ENV: &str = "NEXTEST_CACHE_FIXTURE_MARKER";
-const EXIT_ENV: &str = "NEXTEST_CACHE_FIXTURE_EXIT";
+const MARKER_ENV: &str = "CACHE_FIXTURE_MARKER";
+const EXIT_ENV: &str = "CACHE_FIXTURE_EXIT";
+const REQUIRED_ENV: &str = "CACHE_FIXTURE_REQUIRED";
+const UNSELECTED_ENV: &str = "CACHE_FIXTURE_UNSELECTED";
 #[cfg(unix)]
-const SIGNAL_ENV: &str = "NEXTEST_CACHE_FIXTURE_SIGNAL";
+const SIGNAL_ENV: &str = "CACHE_FIXTURE_SIGNAL";
 
 #[test]
 fn fixture_child() {
@@ -26,6 +28,12 @@ fn run_fixture_child() {
     let Some(marker) = env::var_os(MARKER_ENV) else {
         return;
     };
+    if env::var_os("PATH").is_none()
+        || env::var_os(REQUIRED_ENV).is_none()
+        || env::var_os(UNSELECTED_ENV).is_some()
+    {
+        std::process::exit(90);
+    }
     let mut contents = fs::read(&marker).unwrap_or_default();
     contents.extend_from_slice(b"executed\n");
     fs::write(marker, contents).unwrap();
@@ -48,6 +56,60 @@ fn successful_execution_is_cached() {
     assert!(first.success());
     let second = fixture.run("run-1", "fixture_child");
     assert!(second.success());
+    assert_eq!(fixture.executions(), 1);
+}
+
+#[test]
+fn selected_environment_is_passed_and_affects_the_key() {
+    let fixture = Fixture::new();
+    assert!(
+        fixture
+            .command("run-1", "fixture_child")
+            .env(REQUIRED_ENV, "one")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        fixture
+            .command("run-1", "fixture_child")
+            .env(REQUIRED_ENV, "two")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 2);
+
+    assert!(
+        fixture
+            .command("run-2", "fixture_child")
+            .env(REQUIRED_ENV, "two")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 2);
+}
+
+#[test]
+fn unselected_environment_is_cleared_and_does_not_affect_the_key() {
+    let fixture = Fixture::new();
+    assert!(
+        fixture
+            .command("run-1", "fixture_child")
+            .env(UNSELECTED_ENV, "one")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        fixture
+            .command("run-2", "fixture_child")
+            .env(UNSELECTED_ENV, "two")
+            .status()
+            .unwrap()
+            .success()
+    );
     assert_eq!(fixture.executions(), 1);
 }
 
@@ -187,16 +249,12 @@ fn corrupt_run_memos_are_replaced() {
 #[test]
 fn leading_separator_is_optional_and_missing_child_is_an_error() {
     let fixture = Fixture::new();
-    let command = fixture.command("run-1", "fixture_child");
-    let args = command.get_args().map(OsStrOwned::from).collect::<Vec<_>>();
     let mut without_separator = Command::new(env!("CARGO_BIN_EXE_nextest-cache"));
     without_separator
-        .args(args.into_iter().skip(1).map(|arg| arg.0))
-        .envs(
-            command
-                .get_envs()
-                .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned()))),
-        );
+        .arg(&fixture.artifact)
+        .arg("--exact")
+        .arg("fixture_child")
+        .arg("--nocapture");
     assert!(without_separator.status().unwrap().success());
 
     assert!(
@@ -247,6 +305,15 @@ impl Fixture {
     fn command(&self, run_id: &str, test_name: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_nextest-cache"));
         command
+            .arg("--env")
+            .arg(MARKER_ENV)
+            .arg("--env")
+            .arg(REQUIRED_ENV)
+            .arg("--env")
+            .arg(EXIT_ENV);
+        #[cfg(unix)]
+        command.arg("--env").arg(SIGNAL_ENV);
+        command
             .arg("--")
             .arg(&self.artifact)
             .arg("--exact")
@@ -258,6 +325,7 @@ impl Fixture {
             .env("NEXTEST_CACHE_DIR", &self.cache)
             .env("NEXTEST_CACHE_TRACE", &self.trace)
             .env(MARKER_ENV, &self.marker)
+            .env(REQUIRED_ENV, "present")
             .env("NEXTEST_TOTAL_ATTEMPTS", "1");
         command
     }
@@ -278,14 +346,6 @@ impl Fixture {
             .unwrap_or_default()
             .lines()
             .count()
-    }
-}
-
-struct OsStrOwned(std::ffi::OsString);
-
-impl From<&std::ffi::OsStr> for OsStrOwned {
-    fn from(value: &std::ffi::OsStr) -> Self {
-        Self(value.to_owned())
     }
 }
 

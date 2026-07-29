@@ -21,17 +21,15 @@ pub(crate) const TRACE_ENV: &str = "NEXTEST_CACHE_TRACE";
 
 const KEY_DOMAIN: &[u8] = b"nextest-wrapper-cache-key";
 pub(crate) type CacheDigest = [u8; 16];
-const FILTERED_ENVIRONMENT: [&str; 9] = [
-    RUN_ID_ENV,
-    "NEXTEST_ATTEMPT_ID",
-    ATTEMPT_ENV,
-    "NEXTEST_TEST_GLOBAL_SLOT",
-    "NEXTEST_TEST_GROUP_SLOT",
-    STRESS_CURRENT_ENV,
-    "NEXTEST_STRESS_TOTAL",
-    "NEXTEST_CACHE_DIR",
-    TRACE_ENV,
-];
+
+#[cfg(target_os = "macos")]
+const DEFAULT_ENVIRONMENT: &[&str] = &["PATH", "DYLD_FALLBACK_LIBRARY_PATH"];
+#[cfg(all(unix, not(target_os = "macos")))]
+const DEFAULT_ENVIRONMENT: &[&str] = &["PATH", "LD_LIBRARY_PATH"];
+#[cfg(windows)]
+const DEFAULT_ENVIRONMENT: &[&str] = &["PATH"];
+#[cfg(not(any(unix, windows)))]
+const DEFAULT_ENVIRONMENT: &[&str] = &["PATH"];
 
 pub(crate) fn find_artifact(command: &[OsString], cwd: &Path) -> Option<PathBuf> {
     let exact_indices = command
@@ -59,8 +57,10 @@ pub(crate) fn find_artifact(command: &[OsString], cwd: &Path) -> Option<PathBuf>
     })
 }
 
-pub(crate) fn effective_environment() -> Vec<(OsString, OsString)> {
-    env::vars_os().collect()
+pub(crate) fn selected_environment(additional: &[String]) -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(name, _)| should_select_environment(name, additional))
+        .collect()
 }
 
 pub(crate) fn derive_token(
@@ -69,10 +69,7 @@ pub(crate) fn derive_token(
     cwd: &Path,
     environment: &[(OsString, OsString)],
 ) -> String {
-    let mut environment = environment
-        .iter()
-        .filter(|(name, _)| !is_filtered_environment(name))
-        .collect::<Vec<_>>();
+    let mut environment = environment.iter().collect::<Vec<_>>();
     environment.sort_by(|(left_name, left_value), (right_name, right_value)| {
         left_name
             .as_encoded_bytes()
@@ -148,9 +145,11 @@ fn update_field(hasher: &mut Xxh3, value: &[u8]) {
     hasher.update(value);
 }
 
-fn is_filtered_environment(name: &OsStr) -> bool {
-    FILTERED_ENVIRONMENT
+fn should_select_environment(name: &OsStr, additional: &[String]) -> bool {
+    DEFAULT_ENVIRONMENT
         .iter()
+        .copied()
+        .chain(additional.iter().map(String::as_str))
         .any(|candidate| environment_name_eq(name, candidate))
 }
 
@@ -260,21 +259,15 @@ mod tests {
     }
 
     #[test]
-    fn volatile_environment_is_filtered() {
-        for name in FILTERED_ENVIRONMENT {
-            assert!(is_filtered_environment(OsStr::new(name)), "{name}");
-            let mut with_control = environment();
-            with_control.push((OsString::from(name), OsString::from("value")));
-            assert_eq!(
-                token([1; 16], &["artifact"], "/cwd", &environment()),
-                token([1; 16], &["artifact"], "/cwd", &with_control),
-                "{name}",
-            );
+    fn environment_selection_uses_defaults_and_explicit_names() {
+        for name in DEFAULT_ENVIRONMENT {
+            assert!(should_select_environment(OsStr::new(name), &[]), "{name}");
         }
-        assert!(!is_filtered_environment(OsStr::new("NEXTEST_TEST_NAME")));
-        assert!(!is_filtered_environment(OsStr::new(
-            "NEXTEST_TOTAL_ATTEMPTS"
-        )));
+        assert!(should_select_environment(
+            OsStr::new("EXPLICIT"),
+            &["EXPLICIT".to_owned()],
+        ));
+        assert!(!should_select_environment(OsStr::new("OTHER"), &[]));
     }
 
     #[test]

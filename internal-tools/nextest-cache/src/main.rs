@@ -59,10 +59,12 @@ fn main() -> ExitCode {
 struct ChildCommand {
     program: OsString,
     args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
 }
 
 impl ChildCommand {
     fn parse(mut args: Vec<OsString>) -> Result<Self, CacheError> {
+        let additional_environment = parse_environment_options(&mut args)?;
         if args.first().is_some_and(|arg| arg == "--") {
             args.remove(0);
         }
@@ -73,6 +75,7 @@ impl ChildCommand {
         Ok(Self {
             program,
             args: args.collect(),
+            environment: cache::selected_environment(&additional_environment),
         })
     }
 
@@ -84,8 +87,61 @@ impl ChildCommand {
     }
 
     fn status(&self) -> Result<ExitStatus, std::io::Error> {
-        Command::new(&self.program).args(&self.args).status()
+        Command::new(&self.program)
+            .args(&self.args)
+            .env_clear()
+            .envs(self.environment.iter().map(|(name, value)| (name, value)))
+            .status()
     }
+}
+
+fn parse_environment_options(args: &mut Vec<OsString>) -> Result<Vec<String>, CacheError> {
+    let mut environment = Vec::new();
+    while args.first().is_some_and(|arg| arg == "--env") {
+        if args.len() < 2 {
+            return Err(CacheError::InvalidInvocation(
+                "`--env` requires an environment variable name".to_owned(),
+            ));
+        }
+        let name = args.remove(1);
+        args.remove(0);
+        environment.push(validate_environment_name(&name)?);
+    }
+
+    if !environment.is_empty() && args.first().is_none_or(|arg| arg != "--") {
+        return Err(CacheError::InvalidInvocation(
+            "`--env` options must be followed by `--` and the child program".to_owned(),
+        ));
+    }
+    Ok(environment)
+}
+
+fn validate_environment_name(name: &OsStr) -> Result<String, CacheError> {
+    let Some(name) = name.to_str() else {
+        return Err(CacheError::InvalidInvocation(
+            "an environment variable name must be valid UTF-8".to_owned(),
+        ));
+    };
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(CacheError::InvalidInvocation(format!(
+            "{name:?} is not a valid environment variable name"
+        )));
+    }
+    if name
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"NEXTEST"))
+    {
+        return Err(CacheError::InvalidInvocation(format!(
+            "{name:?} begins with `NEXTEST`, which is reserved for nextest"
+        )));
+    }
+    Ok(name.to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,7 +233,7 @@ fn try_prepare_cache(
         &artifact_digest.bytes,
         &command_line,
         &cwd,
-        &cache::effective_environment(),
+        &command.environment,
     );
 
     if mode == CacheMode::Retry {
@@ -213,4 +269,42 @@ fn warn(message: impl std::fmt::Display) {
 fn report_fatal(error: CacheError) -> ExitCode {
     eprintln!("nextest-cache: {error}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_options_are_parsed_before_the_separator() {
+        let mut args = ["--env", "FIRST", "--env", "SECOND", "--", "child"]
+            .map(OsString::from)
+            .to_vec();
+        assert_eq!(
+            parse_environment_options(&mut args).unwrap(),
+            ["FIRST", "SECOND"],
+        );
+        assert_eq!(args, ["--", "child"].map(OsString::from));
+    }
+
+    #[test]
+    fn environment_options_require_a_separator() {
+        let mut args = ["--env", "SELECTED", "child"].map(OsString::from).to_vec();
+        let error = parse_environment_options(&mut args).unwrap_err();
+        assert!(matches!(error, CacheError::InvalidInvocation(_)));
+    }
+
+    #[test]
+    fn environment_names_are_portable_and_not_reserved() {
+        for valid in ["NAME", "_NAME", "NAME_2"] {
+            assert_eq!(validate_environment_name(OsStr::new(valid)).unwrap(), valid);
+        }
+        for invalid in ["", "2_NAME", "A=B", "NEXTEST", "NEXTEST_PROFILE"] {
+            let error = validate_environment_name(OsStr::new(invalid)).unwrap_err();
+            assert!(
+                matches!(error, CacheError::InvalidInvocation(_)),
+                "{invalid}"
+            );
+        }
+    }
 }
