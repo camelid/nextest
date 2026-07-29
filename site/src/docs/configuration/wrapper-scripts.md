@@ -80,6 +80,24 @@ A wrapper script will be invoked with the test binary as the first argument, and
 
     Make sure your wrapper script runs the test binary and arguments passed into it! If you do not do so, your test will succeed even though it isn't being executed.
 
+### Reporting wrapper notes
+
+Run wrappers can add a short note to nextest's status output. Nextest sets
+`NEXTEST_RUN_WRAPPER_REPORT` to the path of an initially absent report file for
+each wrapped test attempt. Before exiting, write a JSON report to that path:
+
+```json
+{"label":"cached"}
+```
+
+The label must contain 1 to 32 ASCII letters, digits, underscores, or hyphens.
+Nextest displays it after the test duration, such as `PASS [0.010s] (cached)`.
+Missing and malformed reports do not affect the test result. Reports can
+annotate any result, including failures.
+
+The environment variable is intended for the wrapper itself. Remove it from
+the environment before starting the test binary.
+
 ### Specifying `env`
 
 <!-- md:version 0.9.131 -->

@@ -4,7 +4,7 @@ expression: out
 ---
 === intermediate ===
 # pass: 
-        PASS [   1.000s] (  1/100) my-binary-id test_name
+        PASS [   1.000s] (cached) (  1/100) my-binary-id test_name
 # leak pass: 
         LEAK [   2.000s] (  2/100) my-binary-id test_name
 # timeout pass: 
@@ -45,7 +45,7 @@ TRY 2 LKFAIL [   1.000s] ( 18/100) my-binary-id test_name
    TRY 2 TMT [  60.000s] ( 19/100) my-binary-id test_name
 === final ===
 # pass: 
-        PASS [   1.000s] ( 20/100) my-binary-id test_name
+        PASS [   1.000s] (cached) ( 20/100) my-binary-id test_name
 # leak pass: 
         LEAK [   2.000s] ( 21/100) my-binary-id test_name
 # timeout pass: 

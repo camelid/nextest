@@ -16,8 +16,12 @@ use crate::{
 use std::{
     env,
     ffi::{OsStr, OsString},
+    fs::OpenOptions,
+    io::Write,
     process::{Command, ExitCode, ExitStatus},
 };
+
+const RUN_WRAPPER_REPORT_ENV: &str = "NEXTEST_RUN_WRAPPER_REPORT";
 
 fn main() -> ExitCode {
     let command = match ChildCommand::parse(env::args_os().skip(1).collect()) {
@@ -27,6 +31,7 @@ fn main() -> ExitCode {
 
     let prepared = prepare_cache(&command);
     if prepared.as_ref().is_some_and(|cache| cache.hit) {
+        report_cache_hit();
         return ExitCode::SUCCESS;
     }
 
@@ -53,6 +58,22 @@ fn main() -> ExitCode {
     }
 
     exit_status::exit(status)
+}
+
+fn report_cache_hit() {
+    let Some(path) = env::var_os(RUN_WRAPPER_REPORT_ENV) else {
+        return;
+    };
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(br#"{"label":"cached"}"#));
+    if let Err(error) = result {
+        warn(format!(
+            "failed to write the run wrapper report to {path:?}: {error}"
+        ));
+    }
 }
 
 #[derive(Debug)]

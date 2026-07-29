@@ -1172,6 +1172,7 @@ mod tests {
                         },
                         output: make_test_output(),
                         result: ExecutionResultDescription::Pass,
+                        run_wrapper_report: None,
                         start_time: Local::now().fixed_offset(),
                         time_taken: Duration::from_secs(1),
                         is_slow: false,

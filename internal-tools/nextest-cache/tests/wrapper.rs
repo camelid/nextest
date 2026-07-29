@@ -11,6 +11,7 @@ const MARKER_ENV: &str = "CACHE_FIXTURE_MARKER";
 const EXIT_ENV: &str = "CACHE_FIXTURE_EXIT";
 const REQUIRED_ENV: &str = "CACHE_FIXTURE_REQUIRED";
 const UNSELECTED_ENV: &str = "CACHE_FIXTURE_UNSELECTED";
+const WRAPPER_REPORT_ENV: &str = "NEXTEST_RUN_WRAPPER_REPORT";
 #[cfg(unix)]
 const SIGNAL_ENV: &str = "CACHE_FIXTURE_SIGNAL";
 
@@ -57,6 +58,32 @@ fn successful_execution_is_cached() {
     let second = fixture.run("run-1", "fixture_child");
     assert!(second.success());
     assert_eq!(fixture.executions(), 1);
+}
+
+#[test]
+fn cache_hits_write_a_wrapper_report() {
+    let fixture = Fixture::new();
+    let report = fixture.temp.path().join("wrapper-report.json");
+
+    assert!(
+        fixture
+            .command("run-1", "fixture_child")
+            .env(WRAPPER_REPORT_ENV, &report)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!report.exists());
+
+    assert!(
+        fixture
+            .command("run-2", "fixture_child")
+            .env(WRAPPER_REPORT_ENV, &report)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read_to_string(report).unwrap(), r#"{"label":"cached"}"#,);
 }
 
 #[test]

@@ -37,3 +37,5 @@ Variables that are not selected are removed before the child command is
 started, so they cannot change test behavior without also changing the cache
 key. Names beginning with `NEXTEST` are reserved for the wrapper and cannot be
 selected.
+
+Cache hits are shown as `(cached)` on nextest's test status lines.

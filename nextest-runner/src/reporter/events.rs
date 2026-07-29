@@ -1278,6 +1278,15 @@ pub struct OutputErrorSlice {
     pub start: usize,
 }
 
+/// A note reported by a run wrapper.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(test_strategy::Arbitrary))]
+pub struct RunWrapperReport {
+    /// A short label describing the wrapper's execution.
+    pub label: String,
+}
+
 /// Information about a single execution of a test.
 ///
 /// This is the external-facing type used by reporters. The `result` field uses
@@ -1307,6 +1316,9 @@ pub struct ExecuteStatus<S: OutputSpec> {
     pub output: ChildExecutionOutputDescription<S>,
     /// The execution result for this test: pass, fail or execution error.
     pub result: ExecutionResultDescription,
+    /// A report produced by the run wrapper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_wrapper_report: Option<RunWrapperReport>,
     /// The time at which the test started.
     #[cfg_attr(
         test,
@@ -2588,6 +2600,7 @@ impl fmt::Display for UnitTerminateSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{output_spec::RecordingSpec, record::ZipStoreOutputDescription};
 
     #[test]
     fn test_is_success() {
@@ -2795,6 +2808,7 @@ mod tests {
                 errors: None,
             },
             result,
+            run_wrapper_report: None,
             start_time: chrono::Utc::now().into(),
             time_taken: Duration::from_millis(100),
             is_slow,
@@ -2802,6 +2816,43 @@ mod tests {
             error_summary: None,
             output_error_slice: None,
         }
+    }
+
+    #[test]
+    fn run_wrapper_report_serialization() {
+        let status = ExecuteStatus::<RecordingSpec> {
+            retry_data: RetryData {
+                attempt: 1,
+                total_attempts: 1,
+            },
+            output: ChildExecutionOutputDescription::Output {
+                result: Some(ExecutionResultDescription::Pass),
+                output: ZipStoreOutputDescription::Split {
+                    stdout: None,
+                    stderr: None,
+                },
+                errors: None,
+            },
+            result: ExecutionResultDescription::Pass,
+            run_wrapper_report: Some(RunWrapperReport {
+                label: "cached".to_owned(),
+            }),
+            start_time: chrono::Utc::now().into(),
+            time_taken: Duration::from_millis(10),
+            is_slow: false,
+            delay_before_start: Duration::ZERO,
+            error_summary: None,
+            output_error_slice: None,
+        };
+
+        let mut value = serde_json::to_value(&status).unwrap();
+        let roundtrip: ExecuteStatus<RecordingSpec> =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(roundtrip, status);
+
+        value.as_object_mut().unwrap().remove("run-wrapper-report");
+        let without_field: ExecuteStatus<RecordingSpec> = serde_json::from_value(value).unwrap();
+        assert_eq!(without_field.run_wrapper_report, None);
     }
 
     #[test]
