@@ -3,6 +3,7 @@
 
 //! Test-process I/O tracing and cacheability decisions.
 
+use crate::fingerprint::{FileFingerprint, fingerprint_file};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::process::id;
@@ -11,17 +12,14 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt,
-    fs::{self, File, Metadata},
-    io::{self, BufRead, BufReader, Read},
+    fs::{self, File},
+    io::{self, BufRead, BufReader},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus},
-    time::SystemTime,
 };
 use thiserror::Error;
-use xxhash_rust::xxh3::Xxh3;
 
-const MANIFEST_VERSION: u32 = 1;
-const HASH_BUFFER_SIZE: usize = 256 * 1024;
+const MANIFEST_VERSION: u32 = 2;
 const RAW_SYSCALLS: &str = concat!(
     "raw=",
     "read,write,pread64,pwrite64,readv,writev,preadv,pwritev,preadv2,pwritev2,",
@@ -79,7 +77,7 @@ impl EffectManifest {
             return Ok(false);
         }
         for input in &self.inputs {
-            if hash_file(Path::new(&input.path))? != input.xxh3_128 {
+            if fingerprint_input(Path::new(&input.path))? != input.fingerprint {
                 return Ok(false);
             }
         }
@@ -91,7 +89,7 @@ impl EffectManifest {
 #[serde(rename_all = "kebab-case")]
 struct FileInput {
     path: String,
-    xxh3_128: String,
+    fingerprint: FileFingerprint,
 }
 
 #[derive(Debug)]
@@ -623,11 +621,11 @@ impl EffectLedger {
                         reasons.insert(EffectReason::UnhashableInput(path));
                         continue;
                     };
-                    match hash_file(&path) {
-                        Ok(xxh3_128) => {
+                    match fingerprint_input(&path) {
+                        Ok(fingerprint) => {
                             inputs.insert(FileInput {
                                 path: path_string.to_owned(),
-                                xxh3_128,
+                                fingerprint,
                             });
                         }
                         Err(_) => {
@@ -932,124 +930,11 @@ fn is_loader_path(path: &Path, cwd: &Path) -> bool {
         .any(|root| !root.as_os_str().is_empty() && path.starts_with(root))
 }
 
-fn hash_file(path: &Path) -> Result<String, EffectError> {
-    hash_file_with(path, || {})
-}
-
-fn hash_file_with(path: &Path, after_read: impl FnOnce()) -> Result<String, EffectError> {
-    let path_before = fs::metadata(path).map_err(|source| EffectError::Io {
-        context: format!(
-            "failed to read metadata for the effect input {}",
-            path.display()
-        ),
+fn fingerprint_input(path: &Path) -> Result<FileFingerprint, EffectError> {
+    fingerprint_file(path).map_err(|source| EffectError::Io {
+        context: format!("failed to fingerprint the effect input {}", path.display()),
         source,
-    })?;
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(source) => {
-            return Err(EffectError::Io {
-                context: format!("failed to open the effect input {}", path.display()),
-                source,
-            });
-        }
-    };
-    let file_before = file.metadata().map_err(|source| EffectError::Io {
-        context: format!(
-            "failed to read metadata for the effect input {}",
-            path.display()
-        ),
-        source,
-    })?;
-    let identity = InputIdentity::new(&file_before);
-    if InputIdentity::new(&path_before) != identity {
-        return Err(input_changed(path));
-    }
-    if !file_before.is_file() {
-        return Err(EffectError::Io {
-            context: format!("the effect input {} is not a regular file", path.display()),
-            source: io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
-        });
-    }
-
-    let mut hasher = Xxh3::new();
-    let mut buffer = vec![0; HASH_BUFFER_SIZE];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => hasher.update(&buffer[..count]),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(source) => {
-                return Err(EffectError::Io {
-                    context: format!("failed to hash the effect input {}", path.display()),
-                    source,
-                });
-            }
-        }
-    }
-
-    after_read();
-    let file_after = file.metadata().map_err(|source| EffectError::Io {
-        context: format!(
-            "failed to re-read metadata for the effect input {}",
-            path.display()
-        ),
-        source,
-    })?;
-    let path_after = fs::metadata(path).map_err(|source| EffectError::Io {
-        context: format!(
-            "failed to re-read path metadata for the effect input {}",
-            path.display()
-        ),
-        source,
-    })?;
-    if InputIdentity::new(&file_after) != identity || InputIdentity::new(&path_after) != identity {
-        return Err(input_changed(path));
-    }
-    Ok(hex::encode(hasher.digest128().to_be_bytes()))
-}
-
-fn input_changed(path: &Path) -> EffectError {
-    EffectError::Io {
-        context: format!(
-            "the effect input {} changed while it was hashed",
-            path.display()
-        ),
-        source: io::Error::new(io::ErrorKind::InvalidData, "input changed"),
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InputIdentity {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
-}
-
-impl InputIdentity {
-    fn new(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_nanoseconds: metadata.ctime_nsec(),
-        }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1253,6 +1138,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn content_addressed_inputs_are_validated() {
         let temp = camino_tempfile::tempdir().unwrap();
@@ -1281,18 +1167,5 @@ mod tests {
         assert!(manifest.is_current().unwrap());
         fs::write(input, b"second").unwrap();
         assert!(!manifest.is_current().unwrap());
-    }
-
-    #[test]
-    fn inputs_changing_while_hashed_are_rejected() {
-        let temp = camino_tempfile::tempdir().unwrap();
-        let input = temp.path().join("input");
-        fs::write(&input, b"first").unwrap();
-
-        assert!(
-            hash_file_with(input.as_std_path(), || fs::write(&input, b"second")
-                .unwrap())
-            .is_err(),
-        );
     }
 }

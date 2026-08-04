@@ -1,6 +1,8 @@
 // Copyright (c) The nextest Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -282,7 +284,7 @@ fn conservative_effect_tracking_rejects_external_reads() {
     assert_eq!(fixture.executions(), 2);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn content_addressed_effect_tracking_validates_external_reads() {
     let fixture = Fixture::new();
@@ -321,6 +323,27 @@ fn content_addressed_effect_tracking_validates_external_reads() {
             .success()
     );
     assert_eq!(fixture.executions(), 2);
+
+    let mode = fs::metadata(&input).unwrap().permissions().mode();
+    fs::set_permissions(&input, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+    assert!(
+        fixture
+            .traced_command("run-5", "fixture_child", "content-addressed", &trace_line)
+            .env(INPUT_ENV, &input)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 3);
+    assert!(
+        fixture
+            .traced_command("run-6", "fixture_child", "content-addressed", &trace_line)
+            .env(INPUT_ENV, &input)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 3);
 }
 
 #[cfg(unix)]

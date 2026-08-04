@@ -7,6 +7,7 @@ mod cache;
 mod effect;
 mod error;
 mod exit_status;
+mod fingerprint;
 mod store;
 
 use crate::{
