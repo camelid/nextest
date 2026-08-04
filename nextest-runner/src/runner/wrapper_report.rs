@@ -28,7 +28,9 @@ enum RunWrapperReportError {
     TooLarge,
     #[error("failed to parse the report: {0}")]
     Parse(#[source] serde_json::Error),
-    #[error("the label must contain 1 to {MAX_LABEL_LEN} ASCII letters, digits, `_`, or `-`")]
+    #[error(
+        "the label must contain 1 to {MAX_LABEL_LEN} ASCII letters, digits, spaces, `_`, `-`, `:`, or `/`, and must start and end with a letter or digit"
+    )]
     InvalidLabel,
 }
 
@@ -81,11 +83,18 @@ fn try_read_report(path: &Utf8TempPath) -> Result<Option<RunWrapperReport>, RunW
 }
 
 fn valid_label(label: &str) -> bool {
-    !label.is_empty()
+    label
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         && label.len() <= MAX_LABEL_LEN
+        && label.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'_' | b'-' | b':' | b'/')
+        })
         && label
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -101,9 +110,9 @@ mod tests {
 
     #[test]
     fn valid_report_is_loaded() {
-        let path = report_path(br#"{"label":"cached"}"#);
+        let path = report_path(br#"{"label":"not cached: I/O effects"}"#);
         let report = read_report(Some(&path)).unwrap();
-        assert_eq!(report.label, "cached");
+        assert_eq!(report.label, "not cached: I/O effects");
     }
 
     #[test]
@@ -116,8 +125,11 @@ mod tests {
     fn invalid_reports_are_ignored() {
         for contents in [
             br#"not json"#.as_slice(),
-            br#"{"label":"bad label"}"#,
             br#"{"label":""}"#,
+            br#"{"label":" leading space"}"#,
+            br#"{"label":"trailing space "}"#,
+            br#"{"label":"bad(label)"}"#,
+            br#"{"label":"bad\nlabel"}"#,
         ] {
             let path = report_path(contents);
             assert_eq!(read_report(Some(&path)), None);
