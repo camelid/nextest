@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::process::id;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
     fmt,
@@ -22,14 +22,12 @@ use xxhash_rust::xxh3::Xxh3;
 
 const MANIFEST_VERSION: u32 = 1;
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
-const TRACED_SYSCALLS: &str = concat!(
-    "trace=",
-    "open,openat,openat2,creat,",
-    "stat,lstat,newfstatat,statx,access,faccessat,faccessat2,readlink,readlinkat,",
-    "unlink,unlinkat,rmdir,truncate,rename,renameat,renameat2,link,linkat,",
-    "symlink,symlinkat,mkdir,mkdirat,mknod,mknodat,",
-    "chmod,fchmodat,chown,lchown,fchownat,utime,utimes,utimensat,",
-    "connect,bind,listen,accept,accept4,execve,execveat",
+const RAW_SYSCALLS: &str = concat!(
+    "raw=",
+    "read,write,pread64,pwrite64,readv,writev,preadv,pwritev,preadv2,pwritev2,",
+    "recvfrom,sendto,recvmsg,sendmsg,recvmmsg,sendmmsg,getrandom,",
+    "getxattr,lgetxattr,fgetxattr,listxattr,llistxattr,flistxattr,",
+    "ioctl,execve,execveat",
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,13 +127,14 @@ impl EffectTrace {
             .args([
                 OsStr::new("-ff"),
                 OsStr::new("-qq"),
+                OsStr::new("-v"),
                 OsStr::new("-s"),
                 OsStr::new("0"),
                 OsStr::new("-yy"),
                 OsStr::new("-e"),
-                OsStr::new(TRACED_SYSCALLS),
+                OsStr::new("trace=all"),
                 OsStr::new("-e"),
-                OsStr::new("raw=execve,execveat"),
+                OsStr::new(RAW_SYSCALLS),
                 OsStr::new("-o"),
             ])
             .arg(&self.trace_prefix)
@@ -173,6 +172,7 @@ pub(crate) enum EffectReason {
     ExternalWrite(PathBuf),
     Network,
     Subprocess,
+    UnclassifiedSyscall(String),
     UnhashableInput(PathBuf),
 }
 
@@ -185,6 +185,9 @@ impl fmt::Display for EffectReason {
             }
             Self::Network => formatter.write_str("network I/O"),
             Self::Subprocess => formatter.write_str("subprocess execution"),
+            Self::UnclassifiedSyscall(name) => {
+                write!(formatter, "unclassified syscall {name}")
+            }
             Self::UnhashableInput(path) => {
                 write!(formatter, "unhashable input {}", path.display())
             }
@@ -213,6 +216,36 @@ struct EffectLedger {
     produced: BTreeSet<PathBuf>,
     network: bool,
     exec_count: usize,
+    unclassified_syscalls: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct TraceState {
+    loader: bool,
+    harness: bool,
+    descriptors: BTreeMap<i32, DescriptorResource>,
+}
+
+#[derive(Clone)]
+enum DescriptorResource {
+    Path(PathBuf),
+    Network,
+    Ambient,
+}
+
+#[derive(Clone, Copy)]
+enum DescriptorOperation {
+    Read,
+    Write,
+}
+
+impl DescriptorOperation {
+    fn unclassified_name(self) -> &'static str {
+        match self {
+            Self::Read => "unclassified descriptor read",
+            Self::Write => "unclassified descriptor write",
+        }
+    }
 }
 
 impl EffectLedger {
@@ -253,18 +286,18 @@ impl EffectLedger {
             context: format!("failed to open the effect trace {}", path.display()),
             source,
         })?;
-        let mut loader_phase = false;
+        let mut state = TraceState::default();
         for line in BufReader::new(file).split(b'\n') {
             let line = line.map_err(|source| EffectError::Io {
                 context: format!("failed to read the effect trace {}", path.display()),
                 source,
             })?;
-            self.record_line(&line, cwd, &mut loader_phase);
+            self.record_line(&line, cwd, &mut state);
         }
         Ok(())
     }
 
-    fn record_line(&mut self, line: &[u8], cwd: &Path, loader_phase: &mut bool) {
+    fn record_line(&mut self, line: &[u8], cwd: &Path, state: &mut TraceState) {
         let Some((name, arguments)) = syscall(line) else {
             return;
         };
@@ -272,11 +305,25 @@ impl EffectLedger {
         match name {
             b"execve" | b"execveat" => {
                 self.exec_count += 1;
-                *loader_phase = succeeded;
+                state.loader = succeeded;
+                state.harness = succeeded;
             }
             b"connect" | b"bind" | b"listen" | b"accept" | b"accept4" => {
-                if !has_flag(arguments, br#"AF_UNIX, sun_path="""#) {
+                let external = !has_flag(arguments, br#"AF_UNIX, sun_path="""#);
+                if external {
                     self.network = true;
+                    if let Some(descriptor) = first_descriptor(arguments) {
+                        state
+                            .descriptors
+                            .insert(descriptor, DescriptorResource::Network);
+                    }
+                    if matches!(name, b"accept" | b"accept4")
+                        && let Some(descriptor) = syscall_result(line)
+                    {
+                        state
+                            .descriptors
+                            .insert(descriptor, DescriptorResource::Network);
+                    }
                 }
             }
             b"open" | b"openat" | b"openat2" => {
@@ -284,11 +331,16 @@ impl EffectLedger {
                 else {
                     return;
                 };
-                if *loader_phase {
+                if state.loader {
                     if is_loader_path(&path, cwd) {
+                        if succeeded && let Some(descriptor) = syscall_result(line) {
+                            state
+                                .descriptors
+                                .insert(descriptor, DescriptorResource::Ambient);
+                        }
                         return;
                     }
-                    *loader_phase = false;
+                    state.loader = false;
                 }
                 if has_flag(arguments, b"O_TMPFILE") {
                     return;
@@ -307,7 +359,12 @@ impl EffectLedger {
                     if !succeeded {
                         self.failed_reads.insert(path.clone());
                     }
-                    self.reads.insert(path);
+                    self.reads.insert(path.clone());
+                }
+                if succeeded && let Some(descriptor) = syscall_result(line) {
+                    state
+                        .descriptors
+                        .insert(descriptor, DescriptorResource::Path(path));
                 }
             }
             b"creat" | b"mkdir" | b"mkdirat" | b"mknod" | b"mknodat" => {
@@ -333,11 +390,11 @@ impl EffectLedger {
                         return;
                     }
                     let path = normalize_path(cwd, &path);
-                    if *loader_phase {
+                    if state.loader {
                         if is_loader_path(&path, cwd) {
                             return;
                         }
-                        *loader_phase = false;
+                        state.loader = false;
                     }
                     if !succeeded {
                         self.failed_reads.insert(path.clone());
@@ -345,7 +402,168 @@ impl EffectLedger {
                     self.reads.insert(path);
                 }
             }
-            _ => {}
+            b"read" | b"pread64" | b"readv" | b"preadv" | b"preadv2" => {
+                self.record_descriptor_io(arguments, cwd, DescriptorOperation::Read, state);
+            }
+            b"write" | b"pwrite64" | b"writev" | b"pwritev" | b"pwritev2" => {
+                self.record_descriptor_io(arguments, cwd, DescriptorOperation::Write, state);
+            }
+            b"fstat" | b"fstat64" | b"fstatfs" | b"fstatfs64" | b"lseek" => {
+                self.record_descriptor_io(arguments, cwd, DescriptorOperation::Read, state);
+            }
+            b"mmap" | b"mmap2" => {
+                if !has_flag(arguments, b"MAP_ANONYMOUS") {
+                    self.record_descriptor_io(arguments, cwd, DescriptorOperation::Read, state);
+                }
+            }
+            b"sendto" | b"sendmsg" | b"sendmmsg" | b"recvfrom" | b"recvmsg" | b"recvmmsg"
+            | b"shutdown" => {
+                self.record_descriptor_network(arguments, state);
+            }
+            b"clone" | b"clone3" | b"fork" | b"vfork" => {
+                if succeeded {
+                    state.harness = false;
+                }
+            }
+            b"getrandom" if state.harness => {}
+            b"close" => {
+                if let Some(descriptor) = first_descriptor(arguments) {
+                    state.descriptors.remove(&descriptor);
+                }
+            }
+            b"socket" => {
+                if succeeded && let Some(descriptor) = syscall_result(line) {
+                    state
+                        .descriptors
+                        .insert(descriptor, DescriptorResource::Ambient);
+                }
+            }
+            b"arch_prctl" | b"brk" | b"exit" | b"exit_group" | b"futex" | b"getpid"
+            | b"getppid" | b"gettid" | b"getuid" | b"geteuid" | b"getgid" | b"getegid"
+            | b"madvise" | b"mprotect" | b"munmap" | b"prctl" | b"prlimit64"
+            | b"restart_syscall" | b"rseq" | b"rt_sigaction" | b"rt_sigprocmask"
+            | b"rt_sigreturn" | b"sched_getaffinity" | b"sched_yield" | b"set_robust_list"
+            | b"set_tid_address" | b"sigaltstack" | b"socketpair" | b"getsockname"
+            | b"getpeername" | b"getsockopt" | b"setsockopt" => {}
+            b"poll" | b"ppoll" => {
+                self.record_poll(arguments, cwd, state);
+            }
+            _ => {
+                self.unclassified_syscalls
+                    .insert(String::from_utf8_lossy(name).into_owned());
+            }
+        }
+    }
+
+    fn record_descriptor_io(
+        &mut self,
+        arguments: &[u8],
+        cwd: &Path,
+        operation: DescriptorOperation,
+        state: &TraceState,
+    ) {
+        let descriptor = first_descriptor(arguments);
+        if descriptor.is_some_and(|descriptor| descriptor <= 2) {
+            return;
+        }
+        let resources = descriptor_resources(arguments).collect::<Vec<_>>();
+        if resources.is_empty() {
+            if let Some(resource) = descriptor.and_then(|fd| state.descriptors.get(&fd)) {
+                self.record_descriptor_resource(resource, operation);
+            } else {
+                self.unclassified_syscalls
+                    .insert(operation.unclassified_name().to_owned());
+            }
+            return;
+        }
+        for resource in resources {
+            if resource.starts_with(b"/") {
+                let path = normalize_path(
+                    cwd,
+                    &PathBuf::from(os_string_from_bytes(descriptor_path(resource).to_vec())),
+                );
+                match operation {
+                    DescriptorOperation::Read => {
+                        self.reads.insert(path);
+                    }
+                    DescriptorOperation::Write => {
+                        self.writes.insert(path);
+                    }
+                }
+            } else if descriptor_is_network(resource) {
+                self.network = true;
+            } else if !descriptor_is_ambient(resource) {
+                self.unclassified_syscalls
+                    .insert(operation.unclassified_name().to_owned());
+            }
+        }
+    }
+
+    fn record_descriptor_resource(
+        &mut self,
+        resource: &DescriptorResource,
+        operation: DescriptorOperation,
+    ) {
+        match (resource, operation) {
+            (DescriptorResource::Path(path), DescriptorOperation::Read) => {
+                self.reads.insert(path.clone());
+            }
+            (DescriptorResource::Path(path), DescriptorOperation::Write) => {
+                self.writes.insert(path.clone());
+            }
+            (DescriptorResource::Network, _) => self.network = true,
+            (DescriptorResource::Ambient, _) => {}
+        }
+    }
+
+    fn record_descriptor_network(&mut self, arguments: &[u8], state: &TraceState) {
+        if descriptor_resources(arguments).any(descriptor_is_network)
+            || has_flag(arguments, b"sa_family=AF_INET")
+            || has_flag(arguments, b"sa_family=AF_INET6")
+            || first_descriptor(arguments)
+                .and_then(|descriptor| state.descriptors.get(&descriptor))
+                .is_some_and(|resource| matches!(resource, DescriptorResource::Network))
+        {
+            self.network = true;
+        }
+    }
+
+    fn record_poll(&mut self, arguments: &[u8], cwd: &Path, state: &TraceState) {
+        if arguments.starts_with(b"[]") {
+            return;
+        }
+        let resources = descriptor_resources(arguments).collect::<Vec<_>>();
+        if resources.is_empty() {
+            let descriptors = poll_descriptors(arguments).collect::<Vec<_>>();
+            if descriptors.is_empty() {
+                self.unclassified_syscalls
+                    .insert("unclassified poll descriptor".to_owned());
+            }
+            for descriptor in descriptors {
+                if descriptor <= 2 {
+                    continue;
+                }
+                if let Some(resource) = state.descriptors.get(&descriptor) {
+                    self.record_descriptor_resource(resource, DescriptorOperation::Read);
+                } else {
+                    self.unclassified_syscalls
+                        .insert("unclassified poll descriptor".to_owned());
+                }
+            }
+            return;
+        }
+        for resource in resources {
+            if resource.starts_with(b"/") {
+                self.reads.insert(normalize_path(
+                    cwd,
+                    &PathBuf::from(os_string_from_bytes(descriptor_path(resource).to_vec())),
+                ));
+            } else if descriptor_is_network(resource) {
+                self.network = true;
+            } else if !descriptor_is_ambient(resource) {
+                self.unclassified_syscalls
+                    .insert("unclassified poll descriptor".to_owned());
+            }
         }
     }
 
@@ -369,6 +587,11 @@ impl EffectLedger {
         if self.exec_count > 1 {
             reasons.insert(EffectReason::Subprocess);
         }
+        reasons.extend(
+            self.unclassified_syscalls
+                .into_iter()
+                .map(EffectReason::UnclassifiedSyscall),
+        );
 
         for path in self.writes {
             let private_and_ephemeral =
@@ -443,8 +666,116 @@ fn syscall_succeeded(line: &[u8]) -> bool {
         && !line.windows(5).any(|window| window == b"= -1 ")
 }
 
+fn syscall_result(line: &[u8]) -> Option<i32> {
+    let start = line.windows(4).rposition(|window| window == b") = ")? + 4;
+    let result = &line[start..];
+    let end = result
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace() || *byte == b'<')
+        .unwrap_or(result.len());
+    parse_i32(&result[..end])
+}
+
 fn has_flag(arguments: &[u8], flag: &[u8]) -> bool {
     arguments.windows(flag.len()).any(|window| window == flag)
+}
+
+fn first_descriptor(arguments: &[u8]) -> Option<i32> {
+    let end = arguments
+        .iter()
+        .position(|byte| *byte == b'<' || *byte == b',')
+        .unwrap_or(arguments.len());
+    parse_i32(&arguments[..end])
+}
+
+fn parse_i32(value: &[u8]) -> Option<i32> {
+    let value = std::str::from_utf8(value).ok()?.trim();
+    if let Some(value) = value.strip_prefix("0x") {
+        i32::from_str_radix(value, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn descriptor_resources(arguments: &[u8]) -> DescriptorResources<'_> {
+    DescriptorResources {
+        remaining: arguments,
+    }
+}
+
+struct DescriptorResources<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> Iterator for DescriptorResources<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let start = self.remaining.iter().position(|byte| *byte == b'<')? + 1;
+        let resource = &self.remaining[start..];
+        let mut depth = 1;
+        for (index, byte) in resource.iter().enumerate() {
+            match byte {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.remaining = &resource[index + 1..];
+                        return Some(&resource[..index]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.remaining = &[];
+        None
+    }
+}
+
+fn descriptor_path(resource: &[u8]) -> &[u8] {
+    let end = resource
+        .iter()
+        .position(|byte| *byte == b'<')
+        .unwrap_or(resource.len());
+    &resource[..end]
+}
+
+fn descriptor_is_network(resource: &[u8]) -> bool {
+    [
+        b"socket:[".as_slice(),
+        b"TCP:[".as_slice(),
+        b"TCPv6:[".as_slice(),
+        b"UDP:[".as_slice(),
+        b"UDPv6:[".as_slice(),
+        b"NETLINK:[".as_slice(),
+        b"UNIX:[".as_slice(),
+        b"UNIX-STREAM:[".as_slice(),
+        b"UNIX-DGRAM:[".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| resource.starts_with(prefix))
+}
+
+fn descriptor_is_ambient(resource: &[u8]) -> bool {
+    [
+        b"pipe:[".as_slice(),
+        b"anon_inode:[".as_slice(),
+        b"memfd:".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| resource.starts_with(prefix))
+}
+
+fn poll_descriptors(arguments: &[u8]) -> impl Iterator<Item = i32> + '_ {
+    arguments.split(|byte| *byte == b',').filter_map(|field| {
+        let start = field.windows(3).position(|window| window == b"fd=")? + 3;
+        let value = &field[start..];
+        let end = value
+            .iter()
+            .position(|byte| !byte.is_ascii_hexdigit() && *byte != b'x')
+            .unwrap_or(value.len());
+        parse_i32(&value[..end])
+    })
 }
 
 fn first_path(arguments: &[u8]) -> Option<PathBuf> {
@@ -727,9 +1058,9 @@ mod tests {
 
     fn ledger(lines: &[&[u8]], cwd: &Path) -> EffectLedger {
         let mut ledger = EffectLedger::default();
-        let mut loader_phase = false;
+        let mut state = TraceState::default();
         for line in lines {
-            ledger.record_line(line, cwd, &mut loader_phase);
+            ledger.record_line(line, cwd, &mut state);
         }
         ledger
     }
@@ -752,6 +1083,55 @@ mod tests {
         assert!(ledger.produced.contains(Path::new("/tmp/out")));
         assert!(ledger.network);
         assert_eq!(ledger.exec_count, 2);
+    }
+
+    #[test]
+    fn raw_descriptor_calls_use_the_open_descriptor_table() {
+        let ledger = ledger(
+            &[
+                br#"execve(0x1, 0x2, 0x3) = 0"#,
+                br#"openat(AT_FDCWD</cwd>, "/lib/libc.so", O_RDONLY) = 0x3</lib/libc.so>"#,
+                br#"read(0x3, 0x1234, 0x20) = 0x20"#,
+                br#"close(3</lib/libc.so>) = 0"#,
+                br#"openat(AT_FDCWD</cwd>, "input", O_RDONLY) = 0x3</cwd/input>"#,
+                br#"read(0x3, 0x1234, 0x20) = 0x20"#,
+                br#"write(0x1, 0x5678, 0x20) = 0x20"#,
+            ],
+            Path::new("/cwd"),
+        );
+
+        assert_eq!(ledger.reads, [PathBuf::from("/cwd/input")].into());
+        assert!(ledger.unclassified_syscalls.is_empty());
+    }
+
+    #[test]
+    fn poll_handles_nested_device_and_pipe_annotations() {
+        let ledger = ledger(
+            &[br#"poll([{fd=0</dev/null<char 1:3>>, events=0}, {fd=1<pipe:[10]>, events=0}, {fd=2<pipe:[11]>, events=0}], 3, 0) = 0 (Timeout)"#],
+            Path::new("/cwd"),
+        );
+
+        assert_eq!(ledger.reads, [PathBuf::from("/dev/null")].into());
+        assert!(ledger.unclassified_syscalls.is_empty());
+    }
+
+    #[test]
+    fn unknown_syscalls_and_test_randomness_fail_closed() {
+        let ledger = ledger(
+            &[
+                br#"execve(0x1, 0x2, 0x3) = 0"#,
+                br#"getrandom(0x1, 0x8, GRND_NONBLOCK) = 0x8"#,
+                br#"clone3(0x1, 88) = 100"#,
+                br#"getrandom(0x1, 0x8, 0) = 0x8"#,
+                br#"future_syscall(1) = 0"#,
+            ],
+            Path::new("/cwd"),
+        );
+
+        assert_eq!(
+            ledger.unclassified_syscalls,
+            ["future_syscall".to_owned(), "getrandom".to_owned()].into(),
+        );
     }
 
     #[test]
