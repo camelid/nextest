@@ -253,23 +253,27 @@ impl EffectLedger {
             context: format!("failed to open the effect trace {}", path.display()),
             source,
         })?;
+        let mut loader_phase = false;
         for line in BufReader::new(file).split(b'\n') {
             let line = line.map_err(|source| EffectError::Io {
                 context: format!("failed to read the effect trace {}", path.display()),
                 source,
             })?;
-            self.record_line(&line, cwd);
+            self.record_line(&line, cwd, &mut loader_phase);
         }
         Ok(())
     }
 
-    fn record_line(&mut self, line: &[u8], cwd: &Path) {
+    fn record_line(&mut self, line: &[u8], cwd: &Path, loader_phase: &mut bool) {
         let Some((name, arguments)) = syscall(line) else {
             return;
         };
         let succeeded = syscall_succeeded(line);
         match name {
-            b"execve" | b"execveat" => self.exec_count += 1,
+            b"execve" | b"execveat" => {
+                self.exec_count += 1;
+                *loader_phase = succeeded;
+            }
             b"connect" | b"bind" | b"listen" | b"accept" | b"accept4" => {
                 if !has_flag(arguments, br#"AF_UNIX, sun_path="""#) {
                     self.network = true;
@@ -280,6 +284,12 @@ impl EffectLedger {
                 else {
                     return;
                 };
+                if *loader_phase {
+                    if is_loader_path(&path, cwd) {
+                        return;
+                    }
+                    *loader_phase = false;
+                }
                 if has_flag(arguments, b"O_TMPFILE") {
                     return;
                 }
@@ -323,6 +333,12 @@ impl EffectLedger {
                         return;
                     }
                     let path = normalize_path(cwd, &path);
+                    if *loader_phase {
+                        if is_loader_path(&path, cwd) {
+                            return;
+                        }
+                        *loader_phase = false;
+                    }
                     if !succeeded {
                         self.failed_reads.insert(path.clone());
                     }
@@ -562,6 +578,29 @@ fn is_ambient_path(path: &Path) -> bool {
     system_path || user_terminfo
 }
 
+fn is_loader_path(path: &Path, cwd: &Path) -> bool {
+    if [
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.preload",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+    {
+        return true;
+    }
+
+    ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"]
+        .iter()
+        .filter_map(env::var_os)
+        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|root| normalize_path(cwd, &root))
+        .any(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+}
+
 fn hash_file(path: &Path) -> Result<String, EffectError> {
     hash_file_with(path, || {})
 }
@@ -688,8 +727,9 @@ mod tests {
 
     fn ledger(lines: &[&[u8]], cwd: &Path) -> EffectLedger {
         let mut ledger = EffectLedger::default();
+        let mut loader_phase = false;
         for line in lines {
-            ledger.record_line(line, cwd);
+            ledger.record_line(line, cwd, &mut loader_phase);
         }
         ledger
     }
@@ -718,6 +758,8 @@ mod tests {
     fn records_failed_file_reads_and_ignores_anonymous_unix_sockets() {
         let ledger = ledger(
             &[
+                br#"execve(0x1, 0x2, 0x3) = 0"#,
+                br#"statx(AT_FDCWD, "/usr/lib/glibc-hwcaps/x86-64-v4", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x1) = -1 ENOENT (No such file or directory)"#,
                 br#"openat(AT_FDCWD, "/missing", O_RDONLY) = -1 ENOENT (No such file or directory)"#,
                 br#"connect(3, {sa_family=AF_UNIX, sun_path=""}, 2) = 0"#,
                 br#"statx(3</proc/self/cgroup>, "", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, 0x1) = 0"#,
