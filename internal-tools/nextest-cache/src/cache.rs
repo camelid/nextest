@@ -68,6 +68,7 @@ pub(crate) fn derive_token(
     command: &[OsString],
     cwd: &Path,
     environment: &[(OsString, OsString)],
+    effect_policy: &[u8],
 ) -> String {
     let mut environment = environment.iter().collect::<Vec<_>>();
     environment.sort_by(|(left_name, left_value), (right_name, right_value)| {
@@ -89,6 +90,7 @@ pub(crate) fn derive_token(
         update_field(&mut hasher, arg.as_encoded_bytes());
     }
     update_field(&mut hasher, cwd.as_os_str().as_encoded_bytes());
+    update_field(&mut hasher, effect_policy);
     update_count(&mut hasher, environment.len());
     for (name, value) in &environment {
         update_field(&mut hasher, name.as_encoded_bytes());
@@ -194,6 +196,7 @@ mod tests {
             &command.iter().map(OsString::from).collect::<Vec<_>>(),
             Path::new(cwd),
             environment,
+            b"effect-ledger-v1:off",
         )
     }
 
@@ -205,7 +208,7 @@ mod tests {
             "/cwd",
             &environment(),
         );
-        assert_eq!(base, "16d45b172876d76f1d3d1c961112cc8d");
+        assert_eq!(base, "5109188d9dfcc1ff61fac565b8cb61ef");
         assert_ne!(
             base,
             token(
@@ -259,6 +262,27 @@ mod tests {
     }
 
     #[test]
+    fn effect_policy_affects_the_key() {
+        let command = [OsString::from("artifact")];
+        assert_ne!(
+            derive_token(
+                &[1; 16],
+                &command,
+                Path::new("/cwd"),
+                &environment(),
+                b"effect-ledger-v1:off",
+            ),
+            derive_token(
+                &[1; 16],
+                &command,
+                Path::new("/cwd"),
+                &environment(),
+                b"effect-ledger-v1:conservative",
+            ),
+        );
+    }
+
+    #[test]
     fn environment_selection_uses_defaults_and_explicit_names() {
         for name in DEFAULT_ENVIRONMENT {
             assert!(should_select_environment(OsStr::new(name), &[]), "{name}");
@@ -308,14 +332,32 @@ mod tests {
             OsString::from_vec(vec![b'V', 0x81]),
         )];
 
-        let base = derive_token(&[0; 16], &command, Path::new("/cwd"), &environment);
-        assert_ne!(
-            base,
-            derive_token(&[0; 16], &changed_command, Path::new("/cwd"), &environment,)
+        let base = derive_token(
+            &[0; 16],
+            &command,
+            Path::new("/cwd"),
+            &environment,
+            b"effect-ledger-v1:off",
         );
         assert_ne!(
             base,
-            derive_token(&[0; 16], &command, Path::new("/cwd"), &changed_environment,)
+            derive_token(
+                &[0; 16],
+                &changed_command,
+                Path::new("/cwd"),
+                &environment,
+                b"effect-ledger-v1:off",
+            )
+        );
+        assert_ne!(
+            base,
+            derive_token(
+                &[0; 16],
+                &command,
+                Path::new("/cwd"),
+                &changed_environment,
+                b"effect-ledger-v1:off",
+            )
         );
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::{
     cache::{CacheDigest, domain_digest},
+    effect::EffectManifest,
     error::CacheError,
 };
 use atomicwrites::{AllowOverwrite, AtomicFile};
@@ -72,12 +73,15 @@ impl CacheStore {
         }
     }
 
-    pub(crate) fn contains_clean_pass(&self, token: &str) -> Result<bool, CacheError> {
+    pub(crate) fn load_clean_pass(
+        &self,
+        token: &str,
+    ) -> Result<Option<EffectManifest>, CacheError> {
         validate_token(token)?;
         let path = self.entry_path(token);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(CacheError::io(
                     format!("failed to read the cache entry {}", path.display()),
@@ -87,16 +91,27 @@ impl CacheStore {
         };
 
         let Ok(entry) = serde_json::from_slice::<CacheEntry>(&bytes) else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(entry.clean_pass)
+        Ok(entry.clean_pass.then_some(entry.effects).flatten())
     }
 
-    pub(crate) fn store_clean_pass(&self, token: &str) -> Result<(), CacheError> {
+    pub(crate) fn store_clean_pass(
+        &self,
+        token: &str,
+        effects: EffectManifest,
+    ) -> Result<(), CacheError> {
         validate_token(token)?;
         self.with_entry_lock(token, || {
             let path = self.entry_path(token);
-            atomic_write_json(&path, &CacheEntry { clean_pass: true }, "the cache entry")
+            atomic_write_json(
+                &path,
+                &CacheEntry {
+                    clean_pass: true,
+                    effects: Some(effects),
+                },
+                "the cache entry",
+            )
         })
     }
 
@@ -669,6 +684,8 @@ fn validate_token(token: &str) -> Result<(), CacheError> {
 #[serde(rename_all = "kebab-case")]
 struct CacheEntry {
     clean_pass: bool,
+    #[serde(default)]
+    effects: Option<EffectManifest>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -734,12 +751,17 @@ mod tests {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
 
-        assert!(!store.contains_clean_pass(TOKEN).unwrap());
-        store.store_clean_pass(TOKEN).unwrap();
-        assert!(store.contains_clean_pass(TOKEN).unwrap());
+        assert!(store.load_clean_pass(TOKEN).unwrap().is_none());
+        store
+            .store_clean_pass(TOKEN, EffectManifest::off())
+            .unwrap();
+        assert_eq!(
+            store.load_clean_pass(TOKEN).unwrap(),
+            Some(EffectManifest::off())
+        );
         store.invalidate(TOKEN).unwrap();
         store.invalidate(TOKEN).unwrap();
-        assert!(!store.contains_clean_pass(TOKEN).unwrap());
+        assert!(store.load_clean_pass(TOKEN).unwrap().is_none());
     }
 
     #[test]
@@ -750,9 +772,9 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         fs::write(&path, b"not json").unwrap();
-        assert!(!store.contains_clean_pass(TOKEN).unwrap());
+        assert!(store.load_clean_pass(TOKEN).unwrap().is_none());
         fs::write(&path, br#"{"clean-pass":false}"#).unwrap();
-        assert!(!store.contains_clean_pass(TOKEN).unwrap());
+        assert!(store.load_clean_pass(TOKEN).unwrap().is_none());
     }
 
     #[test]
@@ -767,7 +789,9 @@ mod tests {
             threads.push(thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..20 {
-                    store.store_clean_pass(TOKEN).unwrap();
+                    store
+                        .store_clean_pass(TOKEN, EffectManifest::off())
+                        .unwrap();
                 }
             }));
         }
@@ -785,7 +809,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert!(store.contains_clean_pass(TOKEN).unwrap());
+        assert!(store.load_clean_pass(TOKEN).unwrap().is_some());
     }
 
     #[test]
@@ -935,7 +959,9 @@ mod tests {
     fn pruning_removes_expired_entries_and_locks() {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
-        store.store_clean_pass(TOKEN).unwrap();
+        store
+            .store_clean_pass(TOKEN, EffectManifest::off())
+            .unwrap();
 
         let entry_path = store.entry_path(TOKEN);
         let entry_lock_path = store.entry_lock_path(TOKEN);
@@ -962,7 +988,9 @@ mod tests {
     fn pruning_is_throttled() {
         let temp = camino_tempfile::tempdir().unwrap();
         let store = CacheStore::from_root(temp.path().into());
-        store.store_clean_pass(TOKEN).unwrap();
+        store
+            .store_clean_pass(TOKEN, EffectManifest::off())
+            .unwrap();
         let entry_path = store.entry_path(TOKEN);
         set_modified_to_epoch(&entry_path);
 

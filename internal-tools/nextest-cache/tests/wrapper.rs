@@ -9,7 +9,9 @@ use std::{
 
 const MARKER_ENV: &str = "CACHE_FIXTURE_MARKER";
 const EXIT_ENV: &str = "CACHE_FIXTURE_EXIT";
+const INPUT_ENV: &str = "CACHE_FIXTURE_INPUT";
 const REQUIRED_ENV: &str = "CACHE_FIXTURE_REQUIRED";
+const TRACE_LINE_ENV: &str = "CACHE_FIXTURE_TRACE_LINE";
 const UNSELECTED_ENV: &str = "CACHE_FIXTURE_UNSELECTED";
 const WRAPPER_REPORT_ENV: &str = "NEXTEST_RUN_WRAPPER_REPORT";
 #[cfg(unix)]
@@ -38,6 +40,9 @@ fn run_fixture_child() {
     let mut contents = fs::read(&marker).unwrap_or_default();
     contents.extend_from_slice(b"executed\n");
     fs::write(marker, contents).unwrap();
+    if let Some(input) = env::var_os(INPUT_ENV) {
+        fs::read(input).unwrap();
+    }
 
     #[cfg(unix)]
     if env::var_os(SIGNAL_ENV).is_some() {
@@ -237,6 +242,113 @@ fn explicit_disable_bypasses_caching() {
 }
 
 #[test]
+fn unavailable_effect_tracing_executes_without_caching() {
+    let fixture = Fixture::new();
+    let report = fixture.temp.path().join("unavailable-report.json");
+    for (index, run_id) in ["run-1", "run-2"].into_iter().enumerate() {
+        let mut command =
+            fixture.command_with_policy(run_id, "fixture_child", Some("conservative"));
+        command.env("PATH", fixture.temp.path());
+        if index == 0 {
+            command.env(WRAPPER_REPORT_ENV, &report);
+        }
+        assert!(command.status().unwrap().success());
+    }
+    assert_eq!(fixture.executions(), 2);
+    assert_eq!(
+        fs::read_to_string(report).unwrap(),
+        r#"{"label":"cache-io-unavailable"}"#,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn conservative_effect_tracking_rejects_external_reads() {
+    let fixture = Fixture::new();
+    let input = fixture.temp.path().join("input");
+    fs::write(&input, b"input").unwrap();
+    let trace_line = format!("openat(AT_FDCWD, {input:?}, O_RDONLY) = 3<{input}>");
+
+    for run_id in ["run-1", "run-2"] {
+        assert!(
+            fixture
+                .traced_command(run_id, "fixture_child", "conservative", &trace_line)
+                .env(INPUT_ENV, &input)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(fixture.executions(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn content_addressed_effect_tracking_validates_external_reads() {
+    let fixture = Fixture::new();
+    let input = fixture.temp.path().join("input");
+    fs::write(&input, b"first").unwrap();
+    let trace_line = format!("openat(AT_FDCWD, {input:?}, O_RDONLY) = 3<{input}>");
+
+    for run_id in ["run-1", "run-2"] {
+        assert!(
+            fixture
+                .traced_command(run_id, "fixture_child", "content-addressed", &trace_line)
+                .env(INPUT_ENV, &input)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(fixture.executions(), 1);
+
+    fs::write(&input, b"second").unwrap();
+    assert!(
+        fixture
+            .traced_command("run-3", "fixture_child", "content-addressed", &trace_line)
+            .env(INPUT_ENV, &input)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 2);
+    assert!(
+        fixture
+            .traced_command("run-4", "fixture_child", "content-addressed", &trace_line)
+            .env(INPUT_ENV, &input)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn effect_tracking_rejects_existing_file_writes() {
+    let fixture = Fixture::new();
+    let output = fixture.temp.path().join("output");
+    fs::write(&output, b"output").unwrap();
+    let trace_line = format!("openat(AT_FDCWD, {output:?}, O_WRONLY) = 3<{output}>");
+
+    assert!(
+        fixture
+            .traced_command("run-1", "fixture_child", "content-addressed", &trace_line)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        fixture
+            .traced_command("run-2", "fixture_child", "content-addressed", &trace_line)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.executions(), 2);
+}
+
+#[test]
 fn cache_infrastructure_failures_execute_the_child() {
     let fixture = Fixture::new();
     assert!(
@@ -299,7 +411,7 @@ fn signal_termination_is_mirrored() {
 
     let fixture = Fixture::new();
     let status = fixture
-        .command("run-1", "fixture_child")
+        .command_with_policy("run-1", "fixture_child", Some("off"))
         .env(SIGNAL_ENV, "1")
         .status()
         .unwrap();
@@ -312,6 +424,8 @@ struct Fixture {
     cache: PathBuf,
     marker: PathBuf,
     trace: PathBuf,
+    #[cfg(unix)]
+    fake_bin: PathBuf,
 }
 
 impl Fixture {
@@ -320,17 +434,28 @@ impl Fixture {
         let source = env::current_exe().unwrap();
         let artifact = temp.path().as_std_path().join(source.file_name().unwrap());
         fs::copy(source, &artifact).unwrap();
+        #[cfg(unix)]
+        let fake_bin = install_fake_strace(temp.path().as_std_path());
         Self {
             cache: temp.path().join("cache").into(),
             marker: temp.path().join("marker").into(),
             trace: temp.path().join("trace").into(),
             artifact,
+            #[cfg(unix)]
+            fake_bin,
             temp,
         }
     }
 
     fn command(&self, run_id: &str, test_name: &str) -> Command {
+        self.command_with_policy(run_id, test_name, None)
+    }
+
+    fn command_with_policy(&self, run_id: &str, test_name: &str, policy: Option<&str>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_nextest-cache"));
+        if let Some(policy) = policy {
+            command.arg("--io-policy").arg(policy);
+        }
         command
             .arg("--env")
             .arg(MARKER_ENV)
@@ -338,6 +463,11 @@ impl Fixture {
             .arg(REQUIRED_ENV)
             .arg("--env")
             .arg(EXIT_ENV);
+        command
+            .arg("--env")
+            .arg(INPUT_ENV)
+            .arg("--env")
+            .arg(TRACE_LINE_ENV);
         #[cfg(unix)]
         command.arg("--env").arg(SIGNAL_ENV);
         command
@@ -354,6 +484,23 @@ impl Fixture {
             .env(MARKER_ENV, &self.marker)
             .env(REQUIRED_ENV, "present")
             .env("NEXTEST_TOTAL_ATTEMPTS", "1");
+        #[cfg(target_os = "linux")]
+        command.env("PATH", &self.fake_bin);
+        command
+    }
+
+    #[cfg(unix)]
+    fn traced_command(
+        &self,
+        run_id: &str,
+        test_name: &str,
+        policy: &str,
+        trace_line: &str,
+    ) -> Command {
+        let mut command = self.command_with_policy(run_id, test_name, Some(policy));
+        command
+            .env("PATH", &self.fake_bin)
+            .env(TRACE_LINE_ENV, trace_line);
         command
     }
 
@@ -374,6 +521,46 @@ impl Fixture {
             .lines()
             .count()
     }
+}
+
+#[cfg(unix)]
+fn install_fake_strace(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let strace = bin.join("strace");
+    fs::write(
+        &strace,
+        br#"#!/bin/sh
+trace=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            trace=$2
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+"$@"
+status=$?
+printf '%s\n' 'execve(0x1, 0x2, 0x3) = 0' > "$trace.$$"
+if [ -n "$CACHE_FIXTURE_TRACE_LINE" ]; then
+    printf '%s\n' "$CACHE_FIXTURE_TRACE_LINE" >> "$trace.$$"
+fi
+exit "$status"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&strace, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
 }
 
 fn find_json_file(root: &Path) -> PathBuf {
