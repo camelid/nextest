@@ -26,9 +26,10 @@ use std::{
 };
 
 const RUN_WRAPPER_REPORT_ENV: &str = "NEXTEST_RUN_WRAPPER_REPORT";
-const NOT_CACHED_IO_EFFECTS: &str = "not-cached-io-effects";
-const NOT_CACHED_TRACING_UNAVAILABLE: &str = "not-cached-tracing-unavailable";
-const NOT_CACHED_TRACING_ERROR: &str = "not-cached-tracing-error";
+const NOT_CACHED_IO_EFFECTS: &str = "not cached: I/O effects";
+const NOT_CACHED_TRACING_UNAVAILABLE: &str = "not cached: tracing unavailable";
+const NOT_CACHED_TRACING_ERROR: &str = "not cached: tracing error";
+const RERUN_INPUTS_CHANGED: &str = "rerun: inputs changed";
 
 fn main() -> ExitCode {
     let command = match ChildCommand::parse(env::args_os().skip(1).collect()) {
@@ -40,6 +41,9 @@ fn main() -> ExitCode {
     if prepared.as_ref().is_some_and(|cache| cache.hit) {
         report_cache_hit();
         return ExitCode::SUCCESS;
+    }
+    if prepared.as_ref().is_some_and(|cache| cache.inputs_changed) {
+        report_wrapper_label(RERUN_INPUTS_CHANGED);
     }
 
     let execution_policy = prepared
@@ -95,7 +99,9 @@ fn report_wrapper_label(label: &str) {
         .create_new(true)
         .open(&path)
         .and_then(|mut file| write!(file, r#"{{"label":"{label}"}}"#));
-    if let Err(error) = result {
+    if let Err(error) = result
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
         warn(format!(
             "failed to write the run wrapper report to {path:?}: {error}"
         ));
@@ -328,6 +334,7 @@ struct PreparedCache {
     token: String,
     mode: CacheMode,
     hit: bool,
+    inputs_changed: bool,
     policy: EffectPolicy,
     _run_lease: RunLease,
 }
@@ -390,19 +397,24 @@ fn try_prepare_cache(
             token,
             mode,
             hit: false,
+            inputs_changed: false,
             policy,
             _run_lease: artifact_digest.run_lease,
         });
     }
-    let hit = match store.load_clean_pass(&token)? {
-        Some(manifest) => manifest.is_current().unwrap_or(false),
-        None => false,
+    let (hit, inputs_changed) = match store.load_clean_pass(&token)? {
+        Some(manifest) => {
+            let is_current = manifest.is_current().unwrap_or(false);
+            (is_current, !is_current)
+        }
+        None => (false, false),
     };
     Ok(PreparedCache {
         store,
         token,
         mode,
         hit,
+        inputs_changed,
         policy,
         _run_lease: artifact_digest.run_lease,
     })

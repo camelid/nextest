@@ -259,7 +259,7 @@ fn unavailable_effect_tracing_executes_without_caching() {
     assert_eq!(fixture.executions(), 2);
     assert_eq!(
         fs::read_to_string(report).unwrap(),
-        r#"{"label":"not-cached-tracing-unavailable"}"#,
+        r#"{"label":"not cached: tracing unavailable"}"#,
     );
 }
 
@@ -284,7 +284,7 @@ fn conservative_effect_tracking_rejects_external_reads() {
     assert_eq!(fixture.executions(), 2);
     assert_eq!(
         fs::read_to_string(report).unwrap(),
-        r#"{"label":"not-cached-io-effects"}"#,
+        r#"{"label":"not cached: I/O effects"}"#,
     );
 }
 
@@ -293,6 +293,7 @@ fn conservative_effect_tracking_rejects_external_reads() {
 fn content_addressed_effect_tracking_validates_external_reads() {
     let fixture = Fixture::new();
     let input = fixture.temp.path().join("input");
+    let changed_report = fixture.temp.path().join("changed-report.json");
     fs::write(&input, b"first").unwrap();
     let trace_line = format!("openat(AT_FDCWD, {input:?}, O_RDONLY) = 3<{input}>");
 
@@ -313,11 +314,16 @@ fn content_addressed_effect_tracking_validates_external_reads() {
         fixture
             .traced_command("run-3", "fixture_child", "content-addressed", &trace_line)
             .env(INPUT_ENV, &input)
+            .env(WRAPPER_REPORT_ENV, &changed_report)
             .status()
             .unwrap()
             .success()
     );
     assert_eq!(fixture.executions(), 2);
+    assert_eq!(
+        fs::read_to_string(changed_report).unwrap(),
+        r#"{"label":"rerun: inputs changed"}"#,
+    );
     assert!(
         fixture
             .traced_command("run-4", "fixture_child", "content-addressed", &trace_line)
