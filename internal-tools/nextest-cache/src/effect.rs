@@ -48,20 +48,6 @@ impl EffectPolicy {
         }
     }
 
-    pub(crate) fn parse(value: &OsStr) -> Result<Self, EffectError> {
-        match value.to_str() {
-            Some("off") => Ok(Self::Off),
-            Some("conservative") => Ok(Self::Conservative),
-            Some("content-addressed") => Ok(Self::ContentAddressed),
-            Some(value) => Err(EffectError::InvalidPolicy(format!(
-                "unsupported value {value:?}"
-            ))),
-            None => Err(EffectError::InvalidPolicy(
-                "the value is not valid UTF-8".to_owned(),
-            )),
-        }
-    }
-
     pub(crate) fn key(self) -> &'static [u8] {
         match self {
             Self::Off => b"effect-ledger-v1:off",
@@ -208,9 +194,6 @@ impl fmt::Display for EffectReason {
 
 #[derive(Debug, Error)]
 pub(crate) enum EffectError {
-    #[error("invalid I/O policy: {0}")]
-    InvalidPolicy(String),
-
     #[error("{context}: {source}")]
     Io {
         context: String,

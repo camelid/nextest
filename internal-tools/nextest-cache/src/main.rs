@@ -15,6 +15,7 @@ use crate::{
     error::CacheError,
     store::{CacheStore, RunLease},
 };
+use clap::{Parser, ValueEnum};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -107,19 +108,32 @@ struct ChildCommand {
 
 impl ChildCommand {
     fn parse(mut args: Vec<OsString>) -> Result<Self, CacheError> {
-        let options = parse_wrapper_options(&mut args)?;
-        if args.first().is_some_and(|arg| arg == "--") {
-            args.remove(0);
+        let has_separator = args.iter().any(|arg| arg == "--");
+        let starts_with_wrapper_option = args
+            .first()
+            .is_some_and(|arg| arg == "--env" || arg == "--io-policy");
+        if !has_separator && !starts_with_wrapper_option {
+            args.insert(0, OsString::from("--"));
         }
-        let mut args = args.into_iter();
-        let program = args.next().ok_or_else(|| {
-            CacheError::InvalidInvocation("the wrapper requires a child program".to_owned())
-        })?;
+        let options = WrapperOptions::try_parse_from(args)
+            .map_err(|error| CacheError::InvalidInvocation(error.to_string()))?;
+        if options.requires_separator() && !has_separator {
+            return Err(CacheError::InvalidInvocation(
+                "wrapper options must be followed by `--` and the child program".to_owned(),
+            ));
+        }
+        let mut command = options.command.into_iter();
+        let program = command
+            .next()
+            .expect("clap requires at least one child command argument");
         Ok(Self {
             program,
-            args: args.collect(),
+            args: command.collect(),
             environment: cache::selected_environment(&options.additional_environment),
-            effect_policy: options.effect_policy,
+            effect_policy: options
+                .effect_policy
+                .map(EffectPolicy::from)
+                .unwrap_or_else(EffectPolicy::default_for_platform),
         })
     }
 
@@ -210,85 +224,61 @@ impl ChildCommand {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Parser)]
+#[command(
+    no_binary_name = true,
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
 struct WrapperOptions {
+    #[arg(long = "env", value_name = "NAME", value_parser = validate_environment_name)]
     additional_environment: Vec<String>,
-    effect_policy: EffectPolicy,
+    #[arg(long = "io-policy", value_enum)]
+    effect_policy: Option<EffectPolicyArg>,
+    #[arg(last = true, required = true, num_args = 1..)]
+    command: Vec<OsString>,
 }
 
-fn parse_wrapper_options(args: &mut Vec<OsString>) -> Result<WrapperOptions, CacheError> {
-    let mut additional_environment = Vec::new();
-    let mut effect_policy = None;
-    let mut parsed_option = false;
-    loop {
-        if args.first().is_some_and(|arg| arg == "--env") {
-            if args.len() < 2 {
-                return Err(CacheError::InvalidInvocation(
-                    "`--env` requires an environment variable name".to_owned(),
-                ));
-            }
-            let name = args.remove(1);
-            args.remove(0);
-            additional_environment.push(validate_environment_name(&name)?);
-            parsed_option = true;
-        } else if args.first().is_some_and(|arg| arg == "--io-policy") {
-            if args.len() < 2 {
-                return Err(CacheError::InvalidInvocation(
-                    "`--io-policy` requires a policy name".to_owned(),
-                ));
-            }
-            if effect_policy.is_some() {
-                return Err(CacheError::InvalidInvocation(
-                    "`--io-policy` may only be specified once".to_owned(),
-                ));
-            }
-            let value = args.remove(1);
-            args.remove(0);
-            effect_policy = Some(
-                EffectPolicy::parse(&value)
-                    .map_err(|error| CacheError::InvalidInvocation(error.to_string()))?,
-            );
-            parsed_option = true;
-        } else {
-            break;
+impl WrapperOptions {
+    fn requires_separator(&self) -> bool {
+        !self.additional_environment.is_empty() || self.effect_policy.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EffectPolicyArg {
+    Off,
+    Conservative,
+    ContentAddressed,
+}
+
+impl From<EffectPolicyArg> for EffectPolicy {
+    fn from(value: EffectPolicyArg) -> Self {
+        match value {
+            EffectPolicyArg::Off => Self::Off,
+            EffectPolicyArg::Conservative => Self::Conservative,
+            EffectPolicyArg::ContentAddressed => Self::ContentAddressed,
         }
     }
-
-    if parsed_option && args.first().is_none_or(|arg| arg != "--") {
-        return Err(CacheError::InvalidInvocation(
-            "wrapper options must be followed by `--` and the child program".to_owned(),
-        ));
-    }
-    Ok(WrapperOptions {
-        additional_environment,
-        effect_policy: effect_policy.unwrap_or_else(EffectPolicy::default_for_platform),
-    })
 }
 
-fn validate_environment_name(name: &OsStr) -> Result<String, CacheError> {
-    let Some(name) = name.to_str() else {
-        return Err(CacheError::InvalidInvocation(
-            "an environment variable name must be valid UTF-8".to_owned(),
-        ));
-    };
+fn validate_environment_name(name: &str) -> Result<String, String> {
     let mut bytes = name.bytes();
     if !bytes
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
-        return Err(CacheError::InvalidInvocation(format!(
-            "{name:?} is not a valid environment variable name"
-        )));
+        return Err(format!("{name:?} is not a valid environment variable name"));
     }
     if name
         .as_bytes()
         .get(..7)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"NEXTEST"))
     {
-        return Err(CacheError::InvalidInvocation(format!(
+        return Err(format!(
             "{name:?} begins with `NEXTEST`, which is reserved for nextest"
-        )));
+        ));
     }
     Ok(name.to_owned())
 }
@@ -435,28 +425,24 @@ mod tests {
 
     #[test]
     fn environment_options_are_parsed_before_the_separator() {
-        let mut args = ["--env", "FIRST", "--env", "SECOND", "--", "child"]
+        let args = ["--env", "FIRST", "--env", "SECOND", "--", "child"]
             .map(OsString::from)
             .to_vec();
-        assert_eq!(
-            parse_wrapper_options(&mut args)
-                .unwrap()
-                .additional_environment,
-            ["FIRST", "SECOND"]
-        );
-        assert_eq!(args, ["--", "child"].map(OsString::from));
+        let command = ChildCommand::parse(args).unwrap();
+        assert_eq!(command.program, "child");
+        assert!(command.args.is_empty());
     }
 
     #[test]
     fn environment_options_require_a_separator() {
-        let mut args = ["--env", "SELECTED", "child"].map(OsString::from).to_vec();
-        let error = parse_wrapper_options(&mut args).unwrap_err();
+        let args = ["--env", "SELECTED", "child"].map(OsString::from).to_vec();
+        let error = ChildCommand::parse(args).unwrap_err();
         assert!(matches!(error, CacheError::InvalidInvocation(_)));
     }
 
     #[test]
     fn io_policy_is_parsed_with_wrapper_options() {
-        let mut args = [
+        let args = [
             "--env",
             "SELECTED",
             "--io-policy",
@@ -466,23 +452,18 @@ mod tests {
         ]
         .map(OsString::from)
         .to_vec();
-        let options = parse_wrapper_options(&mut args).unwrap();
-        assert_eq!(options.additional_environment, ["SELECTED"]);
-        assert_eq!(options.effect_policy, EffectPolicy::Conservative);
-        assert_eq!(args, ["--", "child"].map(OsString::from));
+        let command = ChildCommand::parse(args).unwrap();
+        assert_eq!(command.effect_policy, EffectPolicy::Conservative);
+        assert_eq!(command.program, "child");
     }
 
     #[test]
     fn environment_names_are_portable_and_not_reserved() {
         for valid in ["NAME", "_NAME", "NAME_2"] {
-            assert_eq!(validate_environment_name(OsStr::new(valid)).unwrap(), valid);
+            assert_eq!(validate_environment_name(valid).unwrap(), valid);
         }
         for invalid in ["", "2_NAME", "A=B", "NEXTEST", "NEXTEST_PROFILE"] {
-            let error = validate_environment_name(OsStr::new(invalid)).unwrap_err();
-            assert!(
-                matches!(error, CacheError::InvalidInvocation(_)),
-                "{invalid}"
-            );
+            validate_environment_name(invalid).unwrap_err();
         }
     }
 }
