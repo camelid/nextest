@@ -259,7 +259,7 @@ fn unavailable_effect_tracing_executes_without_caching() {
     assert_eq!(fixture.executions(), 2);
     assert_eq!(
         fs::read_to_string(report).unwrap(),
-        r#"{"label":"cache-io-unavailable"}"#,
+        r#"{"label":"not-cached-tracing-unavailable"}"#,
     );
 }
 
@@ -268,20 +268,24 @@ fn unavailable_effect_tracing_executes_without_caching() {
 fn conservative_effect_tracking_rejects_external_reads() {
     let fixture = Fixture::new();
     let input = fixture.temp.path().join("input");
+    let report = fixture.temp.path().join("io-effects-report.json");
     fs::write(&input, b"input").unwrap();
     let trace_line = format!("openat(AT_FDCWD, {input:?}, O_RDONLY) = 3<{input}>");
 
-    for run_id in ["run-1", "run-2"] {
-        assert!(
-            fixture
-                .traced_command(run_id, "fixture_child", "conservative", &trace_line)
-                .env(INPUT_ENV, &input)
-                .status()
-                .unwrap()
-                .success()
-        );
+    for (index, run_id) in ["run-1", "run-2"].into_iter().enumerate() {
+        let mut command =
+            fixture.traced_command(run_id, "fixture_child", "conservative", &trace_line);
+        command.env(INPUT_ENV, &input);
+        if index == 0 {
+            command.env(WRAPPER_REPORT_ENV, &report);
+        }
+        assert!(command.status().unwrap().success());
     }
     assert_eq!(fixture.executions(), 2);
+    assert_eq!(
+        fs::read_to_string(report).unwrap(),
+        r#"{"label":"not-cached-io-effects"}"#,
+    );
 }
 
 #[cfg(target_os = "linux")]

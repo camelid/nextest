@@ -26,6 +26,9 @@ use std::{
 };
 
 const RUN_WRAPPER_REPORT_ENV: &str = "NEXTEST_RUN_WRAPPER_REPORT";
+const NOT_CACHED_IO_EFFECTS: &str = "not-cached-io-effects";
+const NOT_CACHED_TRACING_UNAVAILABLE: &str = "not-cached-tracing-unavailable";
+const NOT_CACHED_TRACING_ERROR: &str = "not-cached-tracing-error";
 
 fn main() -> ExitCode {
     let command = match ChildCommand::parse(env::args_os().skip(1).collect()) {
@@ -65,7 +68,7 @@ fn main() -> ExitCode {
                             "not caching this test because it performed {reason}"
                         ));
                     }
-                    report_wrapper_label("cache-io-bypass");
+                    report_wrapper_label(NOT_CACHED_IO_EFFECTS);
                     cache.store.invalidate(&cache.token)
                 }
                 None => cache.store.invalidate(&cache.token),
@@ -175,7 +178,7 @@ impl ChildCommand {
                 warn(format!(
                     "I/O tracing is unavailable: {error}; running without caching"
                 ));
-                report_wrapper_label("cache-io-unavailable");
+                report_wrapper_label(NOT_CACHED_TRACING_UNAVAILABLE);
                 return self
                     .plain_status()
                     .map(|status| (status, None))
@@ -188,7 +191,7 @@ impl ChildCommand {
                 warn(format!(
                     "I/O tracing is unavailable: {error}; running without caching"
                 ));
-                report_wrapper_label("cache-io-unavailable");
+                report_wrapper_label(NOT_CACHED_TRACING_UNAVAILABLE);
                 return self
                     .plain_status()
                     .map(|status| (status, None))
@@ -199,7 +202,7 @@ impl ChildCommand {
             Ok(effects) => Some(effects),
             Err(EffectError::TestNotStarted) if !status.success() => {
                 warn("strace did not start the test; retrying without caching");
-                report_wrapper_label("cache-io-unavailable");
+                report_wrapper_label(NOT_CACHED_TRACING_UNAVAILABLE);
                 return self
                     .plain_status()
                     .map(|status| (status, None))
@@ -209,7 +212,7 @@ impl ChildCommand {
                 warn(format!(
                     "failed to read the I/O effect ledger: {error}; running without caching"
                 ));
-                report_wrapper_label("cache-io-error");
+                report_wrapper_label(NOT_CACHED_TRACING_ERROR);
                 None
             }
         };
